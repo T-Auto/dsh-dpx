@@ -1,0 +1,39 @@
+{
+  "name": "dsh-dpx",
+  "version": "0.1.0",
+  "description": "Isolated, discoverable npm environments for DeepSeek Harness",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dpx": "bin/dpx.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "dsh-distribution.json",
+    "README.md",
+    "docs/"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "npm run test && node --check bin/dpx.js && node --check src/index.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "isolated-environment",
+    "npm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/T-Auto/dsh-dpx.git"
+  },
+  "bugs": {
+    "url": "https://github.com/T-Auto/dsh-dpx/issues"
+  },
+  "homepage": "https://github.com/T-Auto/dsh-dpx#readme"
+}

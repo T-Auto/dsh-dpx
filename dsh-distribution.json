@@ -1,0 +1,44 @@
+{
+  "apiVersion": "distribution.dsh.dev/v1alpha1",
+  "kind": "DistributionDescriptor",
+  "distribution": {
+    "id": "urn:dsh:distribution:t-auto:dsh-dpx",
+    "version": "0.1.0"
+  },
+  "displayName": "dsh-dpx isolated DeepSeek Harness environment manager",
+  "protocols": [
+    {
+      "apiVersion": "layout.distribution.dsh.dev/v1alpha1",
+      "kind": "ManagedLayout",
+      "required": true,
+      "spec": {
+        "resources": [
+          {
+            "id": "environment-root",
+            "role": "data",
+            "location": { "type": "relative-path", "value": "./environments" },
+            "ownership": "exclusive",
+            "portability": "conditional",
+            "sensitivity": "private"
+          },
+          {
+            "id": "registry",
+            "role": "config",
+            "location": { "type": "relative-path", "value": "./registry.json" },
+            "ownership": "exclusive",
+            "portability": "conditional",
+            "sensitivity": "private"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "discovery.distribution.dsh.dev/v1alpha1",
+      "kind": "EnvironmentDiscovery",
+      "required": false,
+      "spec": {
+        "references": ["urn:dsh:dpx:descriptor:0.1.0"]
+      }
+    }
+  ]
+}
