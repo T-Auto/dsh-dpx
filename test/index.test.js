@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -63,7 +63,7 @@ test('creates a private isolated environment and a discoverable record', async (
   assert.match(record.instance.instanceId, /^urn:uuid:/);
   assert.equal(record.discoverableEntry.status, 'published');
   assert.ok(record.discoverableEntry.contentDigest.startsWith('sha256:'));
-  for (const location of [paths.npmPrefix, paths.npmCache, paths.dshHome, paths.agentsHome, paths.workspace, paths.desktop, paths.descriptor, paths.manifest]) {
+  for (const location of [paths.npmPrefix, paths.npmCache, paths.dshHome, paths.agentsHome, paths.workspace, paths.desktopHome, paths.desktop, paths.descriptor, paths.manifest]) {
     assert.ok(existsSync(location), `missing ${location}`);
   }
   assert.deepEqual(JSON.parse(await readFile(paths.descriptor, 'utf8')), environmentDescriptor({ desktop: true }));
@@ -74,6 +74,17 @@ test('creates a private isolated environment and a discoverable record', async (
   assert.equal(registry.environments.length, 1);
   const second = await createEnvironment({ name: 'test', storageRoot: root, home, publishDiscovery: false, platform: 'win32' });
   assert.deepEqual(second, record);
+});
+
+test('repairs the isolated Windows Desktop when reusing an older environment', async () => {
+  const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+  const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+  const record = await createEnvironment({ name: 'repair', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+  const paths = pathsFor(record.root);
+  await rm(paths.desktopHome, { recursive: true, force: true });
+  assert.equal(existsSync(paths.desktopHome), false);
+  await createEnvironment({ name: 'repair', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+  assert.equal(existsSync(paths.desktopHome), true);
 });
 
 test('can create a CLI-only environment without copying a desktop launcher', async () => {

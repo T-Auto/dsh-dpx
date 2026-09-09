@@ -79,13 +79,19 @@ export function environmentRoot(storageRoot, name) {
 
 export function pathsFor(root) {
   const absolute = resolve(root);
+  const home = join(absolute, 'home');
   return {
     root: absolute,
     npmPrefix: join(absolute, 'npm-prefix'),
     npmCache: join(absolute, 'npm-cache'),
     dshHome: join(absolute, 'dsh-home'),
     agentsHome: join(absolute, 'agents-home'),
-    home: join(absolute, 'home'),
+    home,
+    // Windows applications commonly derive the first workspace location from
+    // USERPROFILE\\Desktop. Keep that location inside the isolated profile and
+    // create it during environment initialization (including upgrades of an
+    // environment created by an older dpx version).
+    desktopHome: join(home, 'Desktop'),
     appData: join(absolute, 'appdata'),
     localAppData: join(absolute, 'localappdata'),
     tmp: join(absolute, 'tmp'),
@@ -98,6 +104,25 @@ export function pathsFor(root) {
     desktopDir: join(absolute, 'desktop'),
     desktop: join(absolute, 'desktop', 'DSH DeepSeek Harness Desktop.exe'),
   };
+}
+
+function environmentDirectories(paths, platform) {
+  const directories = [
+    paths.npmPrefix, paths.npmCache, paths.dshHome, paths.agentsHome, paths.home,
+    paths.appData, paths.localAppData, paths.tmp, paths.xdgConfig, paths.xdgCache,
+    paths.xdgData, paths.workspace,
+  ];
+  // Node and many Windows file pickers resolve the user's Desktop from
+  // USERPROFILE. Without this directory, the first workspace setup shows the
+  // native "location unavailable" dialog before the user can choose anything.
+  if (platform === 'win32') directories.push(paths.desktopHome);
+  return directories;
+}
+
+async function ensureEnvironmentDirectories(paths, platform) {
+  for (const directory of environmentDirectories(paths, platform)) {
+    await mkdir(directory, { recursive: true });
+  }
 }
 
 export function environmentDescriptor({ desktop = false } = {}) {
@@ -217,6 +242,10 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
     const existing = registry.environments.find(row => row.name === name);
     if (existing) {
       if (resolve(existing.root) !== root) throw new Error(`Environment --${name} is already registered at ${existing.root}.`);
+      // Also repair environments created before the isolated Windows profile
+      // folders were initialized. This makes the fix effective without asking
+      // users to remove and recreate an existing environment.
+      await ensureEnvironmentDirectories(pathsFor(existing.root), platform);
       return existing;
     }
     if (existsSync(root)) {
@@ -224,11 +253,7 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
       if (contents.length > 0) throw new Error(`Refusing to adopt non-empty environment directory: ${root}`);
     }
     const paths = pathsFor(root);
-    for (const directory of [
-      paths.npmPrefix, paths.npmCache, paths.dshHome, paths.agentsHome, paths.home,
-      paths.appData, paths.localAppData, paths.tmp, paths.xdgConfig, paths.xdgCache,
-      paths.xdgData, paths.workspace,
-    ]) await mkdir(directory, { recursive: true });
+    await ensureEnvironmentDirectories(paths, platform);
     const instanceId = `urn:uuid:${randomUUID()}`;
     const instance = {
       apiVersion: 'discovery.distribution.dsh.dev/v1alpha1',
@@ -284,6 +309,9 @@ export async function resolveEnvironment(name, home = defaultRegistryHome()) {
   const record = registry.environments.find(row => row.name === name);
   if (!record) throw new Error(`Environment --${name} is not registered. Create it with: dpx npm install -g @deepseek-ai/dsh --${name} --<absolute-storage-root>`);
   if (!existsSync(record.root)) throw new Error(`Environment --${name} is registered but its root is missing: ${record.root}`);
+  // Repair profile directories for environments created by older dpx versions
+  // before a caller launches npm, dsh, or the desktop shell.
+  await ensureEnvironmentDirectories(pathsFor(record.root), process.platform);
   return record;
 }
 

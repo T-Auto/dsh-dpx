@@ -127,6 +127,13 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
     let root = resolve_env_root()?;
     let node = resolve_node()?;
     let bin = resolve_dsh_bin(&root)?;
+    // DSH and Windows file pickers derive the initial workspace location from
+    // USERPROFILE\\Desktop. The launcher overrides USERPROFILE with the
+    // isolated profile, so create that directory before DSH starts. This also
+    // repairs environments created by an older dpx version when the EXE is
+    // opened directly (without going through the dpx CLI).
+    let desktop = root.join("home").join("Desktop");
+    std::fs::create_dir_all(&desktop).map_err(|error| format!("无法创建桌面工作目录：{error}"))?;
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).map_err(|error| format!("无法创建工作目录：{error}"))?;
 

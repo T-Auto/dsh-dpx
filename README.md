@@ -77,7 +77,9 @@ D:\DevEnvs\Projects\dsh-environments\test\
 ├── npm-cache\                 # test 专属的 npm 下载/内容缓存
 ├── dsh-home\                  # test 专属 DSH_HOME：profiles、设置、会话、存储
 ├── agents-home\               # test 专属 DSH_AGENTS_HOME：agents / skills
-├── home\ appdata\ localappdata\ tmp\
+├── home\
+│   └── Desktop\               # Windows 首次建立工作区使用的默认位置
+├── appdata\ localappdata\ tmp\
 ├── workspace\                 # dpx 启动 DSH 时的工作目录
 ├── desktop\
 │   └── DSH DeepSeek Harness Desktop.exe
@@ -85,6 +87,8 @@ D:\DevEnvs\Projects\dsh-environments\test\
 ├── dsh-distribution.json       # 环境的 dsh-distribution 描述符
 └── .dpx-environment.json       # 实例身份和 DPX 注册记录的本地副本
 ```
+
+其中 Windows 的 `home\\Desktop` 会在首次创建环境时一并建立；复用旧环境时 dpx 也会自动补齐，避免首次建立工作区时出现“位置不可用”。
 
 因此，该环境的 DSH、缓存、配置、会话、插件 profile 与用户目录变量全部是独立的；它不会修改：
 
