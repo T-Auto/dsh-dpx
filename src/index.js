@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 export const FORMAT = 1;
@@ -18,6 +19,7 @@ const TARGET_OPTIONS = new Set([
   '--help', '-h', '--version', '--profile', '--dump-config', '--dump-default-config',
   '--config', '--no-open', '--open', '--host', '--port', '--verbose', '--debug',
 ]);
+const NO_DESKTOP_OPTION = '--no-desktop';
 
 export function defaultRegistryHome(env = process.env, platform = process.platform) {
   if (env.DPX_HOME?.trim()) return resolve(env.DPX_HOME);
@@ -42,11 +44,16 @@ export function assertEnvironmentName(name) {
   return name.toLowerCase();
 }
 
-export function parseEnvironmentArguments(args) {
+export function parseEnvironmentArguments(args, { parseDesktop = true } = {}) {
   let name;
   let root;
+  let desktop = true;
   const passthrough = [];
   for (const arg of args) {
+    if (parseDesktop && arg === NO_DESKTOP_OPTION) {
+      desktop = false;
+      continue;
+    }
     if (arg.startsWith('--') && arg.length > 2) {
       const candidate = arg.slice(2);
       if (WINDOWS_DRIVE_PATH.test(candidate) || isAbsolute(candidate)) {
@@ -62,7 +69,7 @@ export function parseEnvironmentArguments(args) {
     passthrough.push(arg);
   }
   if (!name) throw new Error('An environment name is required, for example --test.');
-  return { name, root, passthrough };
+  return { name, root, passthrough, desktop };
 }
 
 export function environmentRoot(storageRoot, name) {
@@ -88,10 +95,22 @@ export function pathsFor(root) {
     workspace: join(absolute, 'workspace'),
     descriptor: join(absolute, 'dsh-distribution.json'),
     manifest: join(absolute, '.dpx-environment.json'),
+    desktopDir: join(absolute, 'desktop'),
+    desktop: join(absolute, 'desktop', 'DSH DeepSeek Harness Desktop.exe'),
   };
 }
 
-export function environmentDescriptor() {
+export function environmentDescriptor({ desktop = false } = {}) {
+  const resources = [
+    resource('npm-prefix', 'extensions', './npm-prefix', 'nonportable'),
+    resource('dsh-home', 'config', './dsh-home', 'conditional'),
+    resource('agents-home', 'config', './agents-home', 'conditional'),
+    resource('npm-cache', 'cache', './npm-cache', 'nonportable'),
+    resource('workspace', 'data', './workspace', 'conditional'),
+  ];
+  // The layout protocol deliberately excludes whitespace in relative path
+  // segments, so it owns the launcher directory rather than its display-named EXE.
+  if (desktop) resources.push(resource('desktop-launcher', 'dsh-dpx:desktop-launcher', './desktop', 'nonportable'));
   return {
     apiVersion: 'distribution.dsh.dev/v1alpha1',
     kind: 'DistributionDescriptor',
@@ -102,13 +121,7 @@ export function environmentDescriptor() {
         apiVersion: 'layout.distribution.dsh.dev/v1alpha1',
         kind: 'ManagedLayout',
         required: true,
-        spec: { resources: [
-          resource('npm-prefix', 'extensions', './npm-prefix', 'nonportable'),
-          resource('dsh-home', 'config', './dsh-home', 'conditional'),
-          resource('agents-home', 'config', './agents-home', 'conditional'),
-          resource('npm-cache', 'cache', './npm-cache', 'nonportable'),
-          resource('workspace', 'data', './workspace', 'conditional'),
-        ] },
+        spec: { resources },
       },
       {
         apiVersion: 'discovery.distribution.dsh.dev/v1alpha1',
@@ -160,6 +173,9 @@ function validateRegistry(registry) {
     if (!isAbsolute(row.root) || row.instance.apiVersion !== 'discovery.distribution.dsh.dev/v1alpha1' || row.instance.kind !== 'EnvironmentInstance' || row.instance.distribution?.id !== DISTRIBUTION.id || row.instance.distribution?.version !== DISTRIBUTION.version) {
       throw new Error('Registry environment binding is invalid.');
     }
+    if (row.desktop !== undefined && (!row.desktop || row.desktop.platform !== 'win32' || row.desktop.launcher !== './desktop/DSH DeepSeek Harness Desktop.exe')) {
+      throw new Error('Registry desktop launcher binding is invalid.');
+    }
     names.add(name);
     ids.add(row.instance.instanceId);
   }
@@ -192,9 +208,10 @@ export async function withRegistryLock(home, operation) {
   }
 }
 
-export async function createEnvironment({ name, storageRoot, home = defaultRegistryHome(), publishDiscovery = true }) {
+export async function createEnvironment({ name, storageRoot, home = defaultRegistryHome(), publishDiscovery = true, desktop = true, platform = process.platform }) {
   name = assertEnvironmentName(name);
   const root = environmentRoot(storageRoot, name);
+  const installDesktop = desktop && platform === 'win32';
   return withRegistryLock(home, async () => {
     const registry = await loadRegistry(home);
     const existing = registry.environments.find(row => row.name === name);
@@ -207,7 +224,11 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
       if (contents.length > 0) throw new Error(`Refusing to adopt non-empty environment directory: ${root}`);
     }
     const paths = pathsFor(root);
-    for (const directory of Object.values(paths).filter(value => !value.endsWith('.json'))) await mkdir(directory, { recursive: true });
+    for (const directory of [
+      paths.npmPrefix, paths.npmCache, paths.dshHome, paths.agentsHome, paths.home,
+      paths.appData, paths.localAppData, paths.tmp, paths.xdgConfig, paths.xdgCache,
+      paths.xdgData, paths.workspace,
+    ]) await mkdir(directory, { recursive: true });
     const instanceId = `urn:uuid:${randomUUID()}`;
     const instance = {
       apiVersion: 'discovery.distribution.dsh.dev/v1alpha1',
@@ -225,8 +246,13 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
       instance,
       discoverableEntry: discoverableEntry(instance, name),
       createdAt: new Date().toISOString(),
+      desktop: installDesktop ? {
+        platform: 'win32',
+        launcher: './desktop/DSH DeepSeek Harness Desktop.exe',
+      } : undefined,
     };
-    await atomicJson(paths.descriptor, environmentDescriptor());
+    await atomicJson(paths.descriptor, environmentDescriptor({ desktop: installDesktop }));
+    if (installDesktop) await installDesktopLauncher(paths.desktop);
     await atomicJson(paths.manifest, record);
     registry.environments.push(record);
     registry.revision += 1;
@@ -261,6 +287,22 @@ export async function resolveEnvironment(name, home = defaultRegistryHome()) {
   return record;
 }
 
+export async function removeEnvironment({ name, home = defaultRegistryHome(), purge = false }) {
+  name = assertEnvironmentName(name);
+  return withRegistryLock(home, async () => {
+    const registry = await loadRegistry(home);
+    const index = registry.environments.findIndex(row => row.name === name);
+    if (index < 0) throw new Error(`Environment --${name} is not registered.`);
+    const [record] = registry.environments.splice(index, 1);
+    const expected = environmentRoot(dirname(dirname(record.root)), name);
+    if (resolve(record.root) !== expected) throw new Error(`Refusing to remove environment with an unsafe root: ${record.root}`);
+    if (purge && existsSync(record.root)) await rm(record.root, { recursive: true, force: false });
+    registry.revision += 1;
+    await atomicJson(registryPath(home), registry);
+    return { record, purged: purge && !existsSync(record.root) };
+  });
+}
+
 export function npmCliPath(node = process.execPath) {
   const candidate = join(dirname(node), 'node_modules', 'npm', 'bin', 'npm-cli.js');
   if (!existsSync(candidate)) throw new Error(`Cannot locate npm-cli.js next to Node: ${candidate}. Set DPX_NPM_CLI to a trusted absolute npm-cli.js path.`);
@@ -271,6 +313,10 @@ export function npmEnvironment(paths, inherited = process.env) {
   const env = { ...inherited };
   delete env.NODE_OPTIONS;
   delete env.NODE_PATH;
+  // Default installs are direct. Remove inherited proxy state so an environment
+  // never silently depends on a host-local proxy. An operator can explicitly
+  // pass npm's --proxy / --https-proxy flags for a single install command.
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NPM_CONFIG_PROXY', 'NPM_CONFIG_HTTPS_PROXY', 'npm_config_proxy', 'npm_config_https_proxy']) delete env[key];
   env.NPM_CONFIG_CACHE = paths.npmCache;
   env.npm_config_cache = paths.npmCache;
   env.NPM_CONFIG_PREFIX = paths.npmPrefix;
@@ -344,6 +390,30 @@ export function publishWindowsRegistry(home, platform = process.platform) {
   if (result.error || result.status !== 0) throw new Error('Could not publish the DPX Windows discovery pointer.');
 }
 
+export function desktopArtifactPath() {
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'windows', 'DSH DeepSeek Harness Desktop.exe');
+}
+
+export function resolvedDesktopArtifact(env = process.env) {
+  const artifact = env.DPX_DESKTOP_ARTIFACT?.trim() || desktopArtifactPath();
+  if (!isAbsolute(artifact)) throw new Error('DPX_DESKTOP_ARTIFACT must be an absolute path.');
+  return artifact;
+}
+
+export function assertDesktopArtifact(env = process.env) {
+  const artifact = resolvedDesktopArtifact(env);
+  if (!existsSync(artifact)) {
+    throw new Error(`Desktop launcher artifact is missing: ${artifact}. Reinstall dsh-dpx, or create this environment with --no-desktop.`);
+  }
+  return artifact;
+}
+
+export async function installDesktopLauncher(destination, env = process.env) {
+  const artifact = assertDesktopArtifact(env);
+  await mkdir(dirname(destination), { recursive: true });
+  await copyFile(artifact, destination);
+}
+
 export function displayEnvironment(record) {
   return {
     name: record.name,
@@ -354,6 +424,7 @@ export function displayEnvironment(record) {
     npmCache: pathsFor(record.root).npmCache,
     dshHome: pathsFor(record.root).dshHome,
     agentsHome: pathsFor(record.root).agentsHome,
+    ...(existsSync(pathsFor(record.root).desktop) ? { desktop: pathsFor(record.root).desktop } : {}),
   };
 }
 
@@ -364,13 +435,20 @@ export function isGlobalInstall(args) {
 export function npmInstallArguments(args, prefix) {
   if (!isGlobalInstall(args)) throw new Error('dpx only accepts npm global installs. Include -g or --global.');
   if (args.some(arg => arg === '--prefix' || arg.startsWith('--prefix='))) throw new Error('dpx owns npm --prefix; do not override it.');
-  return [...args, '--prefix', prefix, '--no-audit', '--no-fund'];
+  const hasProxy = args.some(arg => arg === '--proxy' || arg.startsWith('--proxy='));
+  const hasHttpsProxy = args.some(arg => arg === '--https-proxy' || arg.startsWith('--https-proxy='));
+  return [
+    ...args,
+    '--prefix', prefix, '--no-audit', '--no-fund',
+    ...(hasProxy ? [] : ['--proxy=null']),
+    ...(hasHttpsProxy ? [] : ['--https-proxy=null']),
+  ];
 }
 
 export function commandUsage() {
   return `dpx — isolated DeepSeek Harness environments\n\n` +
-    `Create and install:\n  dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --D:\\DevEnvs\\Projects\n\n` +
+    `Create and install:\n  dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --D:\\DevEnvs\\Projects\n  dpx npm install -g @deepseek-ai/dsh --test --D:\\DevEnvs\\Projects --no-desktop\n\n` +
     `Reuse an environment:\n  dpx npm install -g @deepseek-harness-tui/dsh-tui --test\n  dpx run --test dsh-tui\n  dpx run --test dsh -- web --no-open\n\n` +
-    `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx descriptor --test\n\n` +
-    `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments.`;
+    `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx env remove --test --purge\n  dpx descriptor --test\n\n` +
+    `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments. New Windows environments receive a desktop EXE unless --no-desktop is supplied.`;
 }

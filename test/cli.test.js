@@ -19,12 +19,14 @@ test('dpx cli installs into the selected isolated npm prefix without network', a
   const registry = join(work, 'registry');
   const fakeNpm = join(work, 'fake-npm.js');
   const capture = join(work, 'npm-capture.json');
-  await writeFile(fakeNpm, `import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path';\nconst args=process.argv.slice(2); const prefix=args[args.indexOf('--prefix')+1]; await mkdir(join(prefix,'node_modules','@deepseek-ai','dsh'),{recursive:true}); await writeFile(join(prefix,'node_modules','@deepseek-ai','dsh','package.json'),'{}'); await writeFile(process.env.CAPTURE,JSON.stringify({args, env:{cache:process.env.NPM_CONFIG_CACHE,prefix:process.env.NPM_CONFIG_PREFIX,nodeOptions:process.env.NODE_OPTIONS}}));`);
+  await writeFile(fakeNpm, `import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path';\nconst args=process.argv.slice(2); const prefix=args[args.indexOf('--prefix')+1]; await mkdir(join(prefix,'node_modules','@deepseek-ai','dsh'),{recursive:true}); await writeFile(join(prefix,'node_modules','@deepseek-ai','dsh','package.json'),'{}'); await writeFile(process.env.CAPTURE,JSON.stringify({args, env:{cache:process.env.NPM_CONFIG_CACHE,prefix:process.env.NPM_CONFIG_PREFIX,nodeOptions:process.env.NODE_OPTIONS,httpsProxy:process.env.HTTPS_PROXY,npmProxy:process.env.npm_config_proxy}}));`);
   const result = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--test', `--${storage}`], {
     DPX_HOME: registry,
     DPX_NPM_CLI: fakeNpm,
     CAPTURE: capture,
     NODE_OPTIONS: '--trace-warnings',
+    HTTPS_PROXY: 'http://127.0.0.1:7897',
+    npm_config_proxy: 'http://127.0.0.1:7897',
     DPX_DISABLE_DISCOVERY: '1',
   });
   assert.equal(result.status, 0, result.stderr);
@@ -33,12 +35,35 @@ test('dpx cli installs into the selected isolated npm prefix without network', a
   assert.equal(captured.env.prefix, join(root, 'npm-prefix'));
   assert.equal(captured.env.cache, join(root, 'npm-cache'));
   assert.equal(captured.env.nodeOptions, undefined);
+  assert.equal(captured.env.httpsProxy, undefined);
+  assert.equal(captured.env.npmProxy, undefined);
   assert.ok(captured.args.includes('--no-audit'));
+  assert.ok(captured.args.includes('--proxy=null'));
+  assert.ok(captured.args.includes('--https-proxy=null'));
   assert.ok(captured.args.includes('--no-fund'));
   assert.ok(existsSync(join(root, 'npm-prefix', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')));
   const listed = run(['env', 'list'], { DPX_HOME: registry });
   assert.equal(listed.status, 0, listed.stderr);
   assert.equal(JSON.parse(listed.stdout).environments[0].name, 'test');
+});
+
+test('dpx copies the packaged desktop launcher by default and omits it with --no-desktop', async () => {
+  const work = await mkdtemp(join(tmpdir(), 'dpx-cli-'));
+  const storage = join(work, 'storage');
+  const registry = join(work, 'registry');
+  const artifact = join(work, 'desktop.exe');
+  const fakeNpm = join(work, 'fake-npm.js');
+  await writeFile(artifact, 'launcher');
+  await writeFile(fakeNpm, '');
+  const common = { DPX_HOME: registry, DPX_NPM_CLI: fakeNpm, DPX_DESKTOP_ARTIFACT: artifact, DPX_DISABLE_DISCOVERY: '1' };
+  const desktop = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--desktop', `--${storage}`], common);
+  assert.equal(desktop.status, 0, desktop.stderr);
+  const copied = join(storage, 'dsh-environments', 'desktop', 'desktop', 'DSH DeepSeek Harness Desktop.exe');
+  if (process.platform === 'win32') assert.equal(await readFile(copied, 'utf8'), 'launcher');
+  else assert.equal(existsSync(copied), false);
+  const cliOnly = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--cli', `--${storage}`, '--no-desktop'], common);
+  assert.equal(cliOnly.status, 0, cliOnly.stderr);
+  assert.equal(existsSync(join(storage, 'dsh-environments', 'cli', 'desktop', 'DSH DeepSeek Harness Desktop.exe')), false);
 });
 
 test('dpx rejects reuse before a named environment is registered', async () => {

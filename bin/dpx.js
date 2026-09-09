@@ -11,6 +11,7 @@ import {
   npmEnvironment,
   npmInstallArguments,
   parseEnvironmentArguments,
+  removeEnvironment,
   pathsFor,
   resolveEnvironment,
   runChild,
@@ -38,7 +39,7 @@ async function npmCommand(args, home, environment) {
   const parsed = parseEnvironmentArguments(npmArgs);
   let record;
   if (parsed.root) {
-    record = await createEnvironment({ name: parsed.name, storageRoot: parsed.root, home });
+    record = await createEnvironment({ name: parsed.name, storageRoot: parsed.root, home, desktop: parsed.desktop });
   } else {
     record = await resolveEnvironment(parsed.name, home);
   }
@@ -53,7 +54,9 @@ async function npmCommand(args, home, environment) {
 }
 
 async function runCommand(args, home, environment) {
-  const parsed = parseEnvironmentArguments(args);
+  // --no-desktop only changes first-time environment creation. Preserve it when
+  // running DSH so a future DSH flag with that spelling is not swallowed.
+  const parsed = parseEnvironmentArguments(args, { parseDesktop: false });
   const [target = 'dsh', ...targetArgs] = parsed.passthrough;
   const record = await resolveEnvironment(parsed.name, home);
   const paths = pathsFor(record.root);
@@ -73,16 +76,25 @@ async function environmentCommand(args, home) {
     return 0;
   }
   if (verb === 'show') {
-    const parsed = parseEnvironmentArguments(rest);
+    const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
     if (parsed.passthrough.length) throw new Error('env show accepts only an environment selector.');
     console.log(JSON.stringify(displayEnvironment(await resolveEnvironment(parsed.name, home)), null, 2));
     return 0;
   }
-  throw new Error('Use `dpx env list` or `dpx env show --name`.');
+  if (verb === 'remove') {
+    const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
+    const purge = parsed.passthrough.includes('--purge');
+    const extras = parsed.passthrough.filter(arg => arg !== '--purge');
+    if (extras.length) throw new Error('env remove accepts only an environment selector and optional --purge.');
+    const removed = await removeEnvironment({ name: parsed.name, home, purge });
+    console.log(JSON.stringify({ removed: removed.record.name, root: removed.record.root, purged: removed.purged }, null, 2));
+    return 0;
+  }
+  throw new Error('Use `dpx env list`, `dpx env show --name`, or `dpx env remove --name [--purge]`.');
 }
 
 async function descriptorCommand(args, home) {
-  const parsed = parseEnvironmentArguments(args);
+  const parsed = parseEnvironmentArguments(args, { parseDesktop: false });
   if (parsed.passthrough.length) throw new Error('descriptor accepts only an environment selector.');
   const record = await resolveEnvironment(parsed.name, home);
   console.log(JSON.stringify({ descriptor: pathsFor(record.root).descriptor, instance: record.instance, discoverableEntry: record.discoverableEntry }, null, 2));

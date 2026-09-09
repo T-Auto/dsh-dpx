@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSH DeepSeek Harness Desktop</title>
+    <style>
+      :root { color-scheme: dark; --black: #000; --surface: #101010; --line: #3b3b3b; --white: #fff; --muted: #b5b5b5; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body { display: grid; place-items: center; padding: 24px; background: var(--black); color: var(--white); font: 14px/1.6 "Segoe UI", system-ui, sans-serif; user-select: none; }
+      main { width: min(620px, 100%); padding: 38px 40px; border: 1px solid var(--line); background: var(--surface); text-align: center; }
+      .mark { width: 64px; height: 64px; margin: 0 auto 20px; display: grid; place-items: center; border: 2px solid var(--white); font-size: 18px; font-weight: 700; letter-spacing: .08em; }
+      h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .01em; }
+      .sub { margin: 5px 0 28px; color: var(--muted); font-size: 13px; }
+      .row { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 25px; }
+      .spinner { width: 15px; height: 15px; border: 2px solid #555; border-top-color: var(--white); border-radius: 50%; animation: spin .8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .status { color: var(--muted); } .status.ready { color: var(--white); } .status.error { color: var(--white); }
+      pre { margin: 22px 0 0; max-height: 240px; overflow: auto; padding: 13px; border: 1px solid var(--line); background: #050505; color: #ddd; text-align: left; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "Cascadia Mono", Consolas, monospace; user-select: text; }
+      button { margin-top: 20px; padding: 8px 20px; color: var(--black); background: var(--white); border: 1px solid var(--white); border-radius: 0; font: inherit; cursor: pointer; }
+      button:hover { color: var(--white); background: var(--black); }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark">DSH</div>
+      <h1>DeepSeek Harness Desktop</h1>
+      <p class="sub" id="environment">隔离环境：desktop</p>
+      <div class="row"><span class="spinner" id="spinner"></span><span class="status" id="status">正在启动本地 DSH 服务…</span></div>
+      <pre id="log" hidden></pre>
+      <button id="retry" hidden>重试</button>
+    </main>
+    <script>
+      const invoke = window.__TAURI__.core.invoke;
+      const spinner = document.getElementById('spinner');
+      const status = document.getElementById('status');
+      const log = document.getElementById('log');
+      const retry = document.getElementById('retry');
+      let timer;
+      function render(value) {
+        if (value.state === 'ready' && value.url) {
+          status.textContent = '服务已就绪，正在载入界面…'; status.className = 'status ready';
+          setTimeout(() => window.location.replace(value.url), 2500); return true;
+        }
+        if (value.state === 'error') {
+          spinner.hidden = true; status.textContent = '启动失败'; status.className = 'status error';
+          log.textContent = value.message || '未知错误'; log.hidden = false; retry.hidden = false; return true;
+        }
+        return false;
+      }
+      async function poll() {
+        try { const value = await invoke('webui_status'); if (!render(value)) timer = setTimeout(poll, 400); }
+        catch (error) { status.textContent = '无法与桌面外壳通信：' + error; status.className = 'status error'; spinner.hidden = true; timer = setTimeout(poll, 1000); }
+      }
+      retry.addEventListener('click', async () => {
+        retry.hidden = true; log.hidden = true; spinner.hidden = false; status.textContent = '正在重新启动本地 DSH 服务…'; status.className = 'status';
+        try { await invoke('restart_webui'); } catch (error) { status.textContent = String(error); status.className = 'status error'; }
+        clearTimeout(timer); poll();
+      });
+      invoke('desktop_environment').then(name => {
+        document.getElementById('environment').textContent = '隔离环境：' + name;
+      }).catch(() => {});
+      poll();
+    </script>
+  </body>
+</html>

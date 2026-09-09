@@ -1,0 +1,14 @@
+{
+  "name": "dsh-dpx-desktop-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Build source for the dsh-dpx per-environment Windows desktop launcher",
+  "type": "module",
+  "scripts": {
+    "build": "tauri build --no-bundle",
+    "icon": "tauri icon app-icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}

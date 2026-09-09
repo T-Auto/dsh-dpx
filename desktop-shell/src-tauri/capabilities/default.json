@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Only exposes the two startup-status commands to the embedded loading page.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
