@@ -297,6 +297,43 @@ npm install -g pnpm
 corepack enable pnpm
 ```
 
+### 隔离的边界：收容「默认解析」，不是写入沙箱
+
+`runtimeEnvironment()` 保证的是**默认路径解析**落在环境内。只要调用方不显式指定绝对路径，npm、pnpm、DSH 与各类工具的默认读写都会落在 `<环境根>` 下：
+
+| 资源 | 环境内位置 |
+| --- | --- |
+| npm 全局 prefix / cache | `<环境根>\npm-prefix`、`<环境根>\npm-cache` |
+| pnpm store | `<环境根>\xdg-data\pnpm\store` |
+| 用户 home | `<环境根>\home`（同时作为 `HOME` / `USERPROFILE`） |
+| `APPDATA` / `LOCALAPPDATA` / `TEMP` | `<环境根>\appdata`、`<环境根>\localappdata`、`<环境根>\tmp` |
+| XDG 三件套 | `<环境根>\xdg-config`、`<环境根>\xdg-cache`、`<环境根>\xdg-data` |
+| DSH 状态与配置 | `<环境根>\dsh-home`、`<环境根>\agents-home` |
+
+三条命令即可确认当前的实际落点：
+
+```powershell
+npm root -g      # <环境根>\npm-prefix\node_modules
+pnpm store path  # <环境根>\xdg-data\pnpm\store\v11
+$HOME            # <环境根>\home
+```
+
+但隔离的机制是**环境变量重定向**，不是文件系统边界。以下三点不在保证范围内：
+
+| 逃逸口 | 机制 | 表现 |
+| --- | --- | --- |
+| 显式绝对路径 | 命令行参数优先于环境变量 | `npm install -g --prefix C:\Users\... <pkg>` 直接写入宿主；`--cache`、`--location` 同理 |
+| `PATH` 是**前置**而非替换 | `env.PATH = [paths.npmPrefix, inherited.PATH]` | 环境内没有的工具会静默回落到宿主的同名二进制。环境内只装了 `dsh` 时，`dsh-tui`、`pnpm` 很可能解析到 `%APPDATA%\npm` 下的宿主副本 |
+| 无写入拦截 | DPX 是环境管理器，不挂文件过滤驱动 | 拥有写权限的进程仍可写宿主任意绝对路径 |
+
+受 `PATH` 回落影响时注意：**二进制所在位置 ≠ 安装目标位置**。宿主那份 `pnpm` 执行时仍读取上述环境变量，因此它的 store 与 global prefix 依然落在环境内。
+
+实践建议：
+
+- 要严格隔离，就不要向 `dpx run` 的命令传递宿主绝对路径，让默认解析生效。
+- 想确认某个工具来自环境内还是宿主，看 `Get-Command <名字>` 解析到的路径，不要看版本号。
+- 需要真正的文件系统边界时，请在本机沙箱／容器层面实现；DPX 只负责环境身份、受控布局与默认路径收容。
+
 ## `dsh-tui --test` 统一启动体验
 
 目标用户体验是：
