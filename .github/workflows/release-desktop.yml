@@ -80,13 +80,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $version = '${{ steps.version.outputs.version }}'
           $tag = "desktop-v$version"
-          gh release view $tag 2>$null
+          $repository = '${{ github.repository }}'
+          $manifest = Get-Content dist/desktop-latest.json -Raw | ConvertFrom-Json
+          $assets = @((Join-Path dist $manifest.assetName), (Join-Path 'dist' 'desktop-latest.json'))
+
+          # Published artifacts are immutable. If the tag already has a release -
+          # created by hand from a locally verified build, or by an earlier run of
+          # this workflow - leave it alone and report it, instead of silently
+          # replacing bytes people may already have downloaded. Bump the desktop
+          # version to publish something new.
+          gh release view $tag --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag (Join-Path dist '*') --clobber
-          } else {
-            gh release create $tag (Join-Path dist '*') `
-              --title "Desktop launcher $version" `
-              --notes "dsh-dpx desktop launcher $version. Update from the tray icon -> 设置 -> 检查更新, or run ``dpx desktop update --<environment>``."
+            Write-Host "::notice title=Already published::$tag already exists; its assets were left untouched."
+            gh release view $tag --repo $repository --json assets --jq '.assets[] | "  \(.name)  \(.digest)"'
+            gh release view $tag --repo $repository --json url --jq '.url'
+            exit 0
           }
+
+          gh release create $tag @assets --repo $repository `
+            --title "Desktop launcher $version" `
+            --notes "dsh-dpx desktop launcher $version. Update from the tray icon -> 设置 -> 检查更新, or run ``dpx desktop update --<environment>``."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
+          Write-Host "Published $tag"

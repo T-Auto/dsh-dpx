@@ -17,14 +17,26 @@ $output = Join-Path $repo 'assets\windows\DSH DeepSeek Harness Desktop.exe'
 
 # Windows PowerShell 5.1 would prepend a UTF-8 BOM with `Set-Content -Encoding utf8`,
 # which breaks JSON.parse on both consumers. Write UTF-8 without a BOM instead.
+#
+# Paths are resolved to absolute first: this script `Push-Location`s into
+# `desktop-shell`, and .NET file APIs (`[System.IO.File]::WriteAllText`) resolve
+# relative paths against the *process* working directory, which PowerShell's
+# location does NOT follow. A relative `-OutputDirectory` would otherwise create
+# the folder under desktop-shell and then fail to write into it.
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+function Resolve-OutputPath([string]$Path) {
+  $expanded = if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path $repo $Path }
+  return [System.IO.Path]::GetFullPath($expanded)
+}
 function Write-JsonFile([string]$Path, $Value) {
-  [System.IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 4), $utf8NoBom)
+  [System.IO.File]::WriteAllText((Resolve-OutputPath $Path), ($Value | ConvertTo-Json -Depth 4), $utf8NoBom)
 }
 
 if ($env:OS -ne 'Windows_NT') {
   throw 'The dsh-dpx desktop launcher is built for Windows.'
 }
+
+if ($OutputDirectory) { $OutputDirectory = Resolve-OutputPath $OutputDirectory }
 
 $shellPackage = Get-Content (Join-Path $shell 'package.json') -Raw | ConvertFrom-Json
 if (-not $Version) { $Version = $shellPackage.version }
