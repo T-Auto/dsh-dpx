@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+
+import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, installBundledDesktopLauncher } from './desktop-release.js';
 
 export const FORMAT = 1;
 export const DPX_API_VERSION = 'dpx.dsh.dev/v1alpha1';
@@ -101,9 +103,13 @@ export function pathsFor(root) {
     workspace: join(absolute, 'workspace'),
     descriptor: join(absolute, 'dsh-distribution.json'),
     manifest: join(absolute, '.dpx-environment.json'),
-    desktopDir: join(absolute, 'desktop'),
-    desktop: join(absolute, 'desktop', 'DSH DeepSeek Harness Desktop.exe'),
+    desktopDir: join(absolute, DESKTOP_LAUNCHER_DIR),
+    desktop: join(absolute, DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME),
   };
+}
+
+export function desktopLauncherRelative() {
+  return `./${DESKTOP_LAUNCHER_DIR}/${DESKTOP_LAUNCHER_NAME}`;
 }
 
 function environmentDirectories(paths, platform) {
@@ -198,7 +204,7 @@ function validateRegistry(registry) {
     if (!isAbsolute(row.root) || row.instance.apiVersion !== 'discovery.distribution.dsh.dev/v1alpha1' || row.instance.kind !== 'EnvironmentInstance' || row.instance.distribution?.id !== DISTRIBUTION.id || row.instance.distribution?.version !== DISTRIBUTION.version) {
       throw new Error('Registry environment binding is invalid.');
     }
-    if (row.desktop !== undefined && (!row.desktop || row.desktop.platform !== 'win32' || row.desktop.launcher !== './desktop/DSH DeepSeek Harness Desktop.exe')) {
+    if (row.desktop !== undefined && (!row.desktop || row.desktop.platform !== 'win32' || row.desktop.launcher !== desktopLauncherRelative())) {
       throw new Error('Registry desktop launcher binding is invalid.');
     }
     names.add(name);
@@ -273,11 +279,11 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
       createdAt: new Date().toISOString(),
       desktop: installDesktop ? {
         platform: 'win32',
-        launcher: './desktop/DSH DeepSeek Harness Desktop.exe',
+        launcher: desktopLauncherRelative(),
       } : undefined,
     };
     await atomicJson(paths.descriptor, environmentDescriptor({ desktop: installDesktop }));
-    if (installDesktop) await installDesktopLauncher(paths.desktop);
+    if (installDesktop) await installPackagedDesktopLauncher(root);
     await atomicJson(paths.manifest, record);
     registry.environments.push(record);
     registry.revision += 1;
@@ -442,6 +448,26 @@ export async function installDesktopLauncher(destination, env = process.env) {
   await copyFile(artifact, destination);
 }
 
+/**
+ * Copy the desktop launcher shipped inside this dpx package into an environment
+ * and record the version/digest stamp the update commands compare against.
+ */
+export async function installPackagedDesktopLauncher(envRoot, env = process.env) {
+  const artifact = assertDesktopArtifact(env);
+  const installed = await installBundledDesktopLauncher({ envRoot, artifactPath: artifact });
+  return { ...installed, artifact };
+}
+
+/** Version of the desktop launcher recorded for an environment, if any. */
+export function desktopVersion(envRoot) {
+  try {
+    const raw = JSON.parse(readFileSync(join(envRoot, DESKTOP_LAUNCHER_DIR, '.dpx-desktop.json'), 'utf8'));
+    return typeof raw?.version === 'string' ? raw.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function displayEnvironment(record) {
   return {
     name: record.name,
@@ -452,7 +478,7 @@ export function displayEnvironment(record) {
     npmCache: pathsFor(record.root).npmCache,
     dshHome: pathsFor(record.root).dshHome,
     agentsHome: pathsFor(record.root).agentsHome,
-    ...(existsSync(pathsFor(record.root).desktop) ? { desktop: pathsFor(record.root).desktop } : {}),
+    ...(existsSync(pathsFor(record.root).desktop) ? { desktop: pathsFor(record.root).desktop, desktopVersion: desktopVersion(record.root) } : {}),
   };
 }
 
@@ -477,6 +503,8 @@ export function commandUsage() {
   return `dpx — isolated DeepSeek Harness environments\n\n` +
     `Create and install:\n  dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --D:\\DevEnvs\\Projects\n  dpx npm install -g @deepseek-ai/dsh --test --D:\\DevEnvs\\Projects --no-desktop\n\n` +
     `Reuse an environment:\n  dpx npm install -g @deepseek-harness-tui/dsh-tui --test\n  dpx run --test dsh-tui\n  dpx run --test dsh -- web --no-open\n\n` +
+    `Desktop launcher (Windows):\n  dpx desktop status --test\n  dpx desktop check  --test\n  dpx desktop update --test\n  dpx desktop install --test --source github:T-Auto/dsh-dpx\n\n` +
     `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx env remove --test --purge\n  dpx descriptor --test\n\n` +
-    `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments. New Windows environments receive a desktop EXE unless --no-desktop is supplied.`;
+    `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments. New Windows environments receive a desktop EXE unless --no-desktop is supplied.\n` +
+    `dpx desktop updates only the desktop launcher, from GitHub Releases by default; --source also accepts an https manifest URL or a local manifest path.`;
 }
