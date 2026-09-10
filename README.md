@@ -76,6 +76,7 @@ D:\DevEnvs\Projects\dsh-environments\test\
 ├── npm-prefix\                # test 专属的 npm 全局包与命令 shim
 ├── npm-cache\                 # test 专属的 npm 下载/内容缓存
 ├── dsh-home\                  # test 专属 DSH_HOME：profiles、设置、会话、存储
+│   └── AGENTS.md              # test 环境的用户全局 DSH 指令（可选）
 ├── agents-home\               # test 专属 DSH_AGENTS_HOME：agents / skills
 ├── home\
 │   └── Desktop\               # Windows 首次建立工作区使用的默认位置
@@ -126,6 +127,14 @@ DPX v0.1 只接受 npm 的全局安装语义（`-g` / `--global`），并自行�
 
 双击该 EXE 后，它只从**自身路径的父目录**推导环境根（可用 `DSH_DESKTOP_ENV` 临时覆盖），再从该环境的 `npm-prefix\node_modules\@deepseek-ai\dsh\package.json` 动态读取 DSH 的 `bin` 入口。它不读取 DPX registry、不调用 `dpx`、不依赖 `D:\AIPC\dsh-desktop`，也不硬编码 DSH 的内部 `lib/bin.js` 位置。它会设置与 `dpx run` 相同的隔离变量并启动 `dsh web --no-open --port 0`；关闭窗口时回收启动的 DSH 子进程树。
 
+因此，desktop 启动的 DSH 全局 `AGENTS.md` 也放在：
+
+```text
+<环境根>\dsh-home\AGENTS.md
+```
+
+desktop EXE 本身没有另一份独立的全局 Agent 指令文件。
+
 因此，后续升级核心版本仍是普通命令：
 
 ```bash
@@ -162,12 +171,23 @@ dpx run --test dsh --version
 每次 `dpx run` 都会为子进程设置环境专属的绝对路径：
 
 ```text
-DSH_HOME
-DSH_AGENTS_HOME
+DSH_HOME=<环境根>\dsh-home
+DSH_AGENTS_HOME=<环境根>\agents-home
 NPM_CONFIG_PREFIX
 NPM_CONFIG_CACHE
 HOME / USERPROFILE / APPDATA / LOCALAPPDATA / TEMP / TMP
 ```
+
+其中两者职责不同：
+
+- `DSH_HOME` 是该隔离环境的 DSH 状态与配置根目录；DSH 的用户全局指令文件固定读取 `DSH_HOME\AGENTS.md`。因此，若要为某个 DPX 环境增加个人全局系统提示词/Agent 指令，应写入：
+  ```text
+  <环境根>\dsh-home\AGENTS.md
+  ```
+- `DSH_AGENTS_HOME` 是该环境的 agents / skills 专属目录；它**不是**用户全局 `AGENTS.md` 的读取位置。
+- 直接运行非 DPX 隔离的 DSH 时，等价的默认位置通常是 `%USERPROFILE%\.dsh\AGENTS.md`；显式设置 `DSH_HOME` 后则以该变量为准。
+
+上述 `DSH_HOME\AGENTS.md` 是环境级全局指令；实际 workspace 或项目目录中的 `AGENTS.md` 仍会按 DSH 的目录发现规则加载，并以更具体的项目规则为准。
 
 同时会清除可能污染环境的 `NODE_OPTIONS`、`NODE_PATH` 及常见代理变量，并设置 `DSH_TELEMETRY_DISABLED=1`。DPX 的 `npm install` 默认显式传入 `--proxy=null --https-proxy=null`，覆盖用户 npmrc；因此创建、安装和升级隔离环境默认直连，**不会自动走**本机 Clash `127.0.0.1:7897`。
 
