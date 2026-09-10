@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Desktop 设置</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <h1>Desktop 设置</h1>
+    <p class="sub" id="subtitle">正在读取环境信息…</p>
+
+    <section>
+      <h2>桌面封装</h2>
+      <div class="row"><span class="label">桌面封装版本</span><span class="value" id="shell-version">—</span></div>
+      <div class="row"><span class="label">环境名</span><span class="value" id="environment">—</span></div>
+      <div class="row"><span class="label">环境根目录</span><span class="value" id="environment-root">—</span></div>
+      <div class="row"><span class="label">启动器</span><span class="value" id="launcher">—</span></div>
+      <div class="row"><span class="label">DSH 包</span><span class="value" id="dsh-package">—</span></div>
+      <div class="row"><span class="label">DSH 入口</span><span class="value" id="dsh-entry">—</span></div>
+      <div class="row"><span class="label">DSH 版本</span><span class="value" id="dsh-version">—</span></div>
+      <div class="row"><span class="label">启动参数</span><span class="value" id="dsh-args">—</span></div>
+
+      <div class="field">
+        <span>更新源（GitHub Release；也可填自建清单 URL 或本地清单路径）</span>
+        <input type="text" id="update-source" placeholder="github:T-Auto/dsh-dpx" spellcheck="false" autocomplete="off" />
+      </div>
+      <div class="field">
+        <span>网络代理（留空则使用系统/环境代理）</span>
+        <input type="text" id="update-proxy" placeholder="http://127.0.0.1:7897" spellcheck="false" autocomplete="off" />
+      </div>
+
+      <div class="actions">
+        <button id="check-update">检查更新</button>
+        <button id="apply-update" class="primary" disabled>立即更新</button>
+      </div>
+      <div class="status" id="update-status" hidden></div>
+      <p class="hint">这里的更新只替换 desktop 封装本身；DSH 本体仍在环境内用 <code>dpx npm install -g @deepseek-ai/dsh</code> 升级，两者互不影响。</p>
+    </section>
+
+    <section>
+      <h2>关闭窗口（右上角 □ X）</h2>
+      <label class="choice"><input type="radio" name="close-action" value="tray" /><span>缩小到托盘图标并保持运行<span class="hint">DSH 继续在后台运行，托盘图标可随时恢复窗口。</span></span></label>
+      <label class="choice"><input type="radio" name="close-action" value="exit" /><span>关闭程序<span class="hint">停止 DSH 并退出桌面封装。</span></span></label>
+      <label class="choice"><input type="radio" name="close-action" value="ask" /><span>每次关闭都询问<span class="hint">恢复首次关闭时的确认弹窗。</span></span></label>
+      <label class="choice"><input type="checkbox" id="tray-enabled" /><span>启用右下角托盘图标<span class="hint">托盘图标右键菜单可打开设置或关闭程序。</span></span></label>
+    </section>
+
+    <section>
+      <h2>服务</h2>
+      <div class="actions">
+        <button id="restart">重启 DSH 服务</button>
+        <button id="open-state">打开状态目录</button>
+        <button id="quit" class="primary">关闭程序</button>
+      </div>
+      <div class="status" id="service-status" hidden></div>
+      <p class="hint" id="log-hint">日志：—</p>
+    </section>
+
+    <script>
+      const invoke = window.__TAURI__.core.invoke;
+      const $ = id => document.getElementById(id);
+      let settings = null;
+
+      function showStatus(element, message, kind) {
+        element.textContent = message;
+        element.className = `status${kind ? ' ' + kind : ''}`;
+        element.hidden = !message;
+      }
+
+      function syncForm() {
+        for (const radio of document.querySelectorAll('input[name="close-action"]')) {
+          radio.checked = radio.value === settings.closeAction;
+        }
+        $('tray-enabled').checked = Boolean(settings.trayEnabled);
+        $('update-source').value = settings.updateSource ?? '';
+        $('update-proxy').value = settings.updateProxy ?? '';
+      }
+
+      function describeCheck(check) {
+        if (!check) return '尚未检查过更新。';
+        const when = check.atMillis ? new Date(check.atMillis).toLocaleString() : '';
+        const parts = [];
+        if (check.installedVersion) parts.push(`当前 ${check.installedVersion}`);
+        if (check.latestVersion) parts.push(`发布源 ${check.latestVersion}`);
+        return [`[${when}] ${check.message ?? check.reason}`, parts.join('　·　')].filter(Boolean).join('\n');
+      }
+
+      async function refresh() {
+        const info = await invoke('desktop_info');
+        settings = await invoke('get_settings');
+        $('subtitle').textContent = `隔离环境 ${info.environment}　·　启动器 ${info.launcherPresent ? '已安装' : '不存在'}`;
+        $('shell-version').textContent = info.shellVersion + (info.launcherVersion && info.launcherVersion !== info.shellVersion ? `（文件记录 ${info.launcherVersion}）` : '');
+        $('environment').textContent = info.environment;
+        $('environment-root').textContent = info.environmentRoot;
+        $('launcher').textContent = info.launcher;
+        $('shell-version').title = info.launcher;
+        $('dsh-package').textContent = info.dsh?.package ?? '未找到';
+        $('dsh-entry').textContent = info.dsh?.entry ?? (info.launchError ?? '—');
+        $('dsh-version').textContent = info.dsh?.version ?? '—';
+        $('dsh-args').textContent = info.dsh ? `${info.dsh.args.join(' ')}` : '—';
+        $('log-hint').textContent = `日志：${info.logPath}`;
+        syncForm();
+        showStatus($('update-status'), describeCheck(settings.lastCheck), settings.lastCheck?.available ? 'ok' : '');
+        $('apply-update').disabled = !settings.lastCheck?.available;
+      }
+
+      async function patch(body, note) {
+        settings = await invoke('save_settings', { patch: body });
+        syncForm();
+        if (note) showStatus($('service-status'), note, 'ok');
+      }
+
+      for (const radio of document.querySelectorAll('input[name="close-action"]')) {
+        radio.addEventListener('change', () => patch({ closeAction: radio.value }));
+      }
+      $('tray-enabled').addEventListener('change', event => patch({ trayEnabled: event.target.checked }));
+      for (const id of ['update-source', 'update-proxy']) {
+        $(id).addEventListener('change', () => patch({ [id === 'update-source' ? 'updateSource' : 'updateProxy']: $(id).value }));
+      }
+
+      $('check-update').addEventListener('click', async () => {
+        $('check-update').disabled = true;
+        showStatus($('update-status'), '正在检查更新…');
+        try {
+          const result = await invoke('check_desktop_update');
+          settings.lastCheck = result;
+          showStatus($('update-status'), describeCheck(result), result.available ? 'ok' : '');
+          $('apply-update').disabled = !result.available;
+        } catch (error) {
+          showStatus($('update-status'), String(error), 'error');
+        } finally {
+          $('check-update').disabled = false;
+        }
+      });
+
+      $('apply-update').addEventListener('click', async () => {
+        $('apply-update').disabled = true;
+        showStatus($('update-status'), '正在下载并校验新版本…程序会自动重启。');
+        try {
+          const result = await invoke('apply_desktop_update');
+          showStatus($('update-status'), `已更新到 ${result.version}${result.restart ? '，正在重启…' : ''}`, 'ok');
+        } catch (error) {
+          showStatus($('update-status'), String(error), 'error');
+          $('apply-update').disabled = false;
+        }
+      });
+
+      $('restart').addEventListener('click', async () => {
+        showStatus($('service-status'), '正在重启 DSH 服务…');
+        try {
+          await invoke('restart_webui');
+          showStatus($('service-status'), '已请求重启，主窗口会自动重新载入。', 'ok');
+        } catch (error) {
+          showStatus($('service-status'), String(error), 'error');
+        }
+      });
+
+      $('open-state').addEventListener('click', async () => {
+        try {
+          const directory = await invoke('open_state_dir');
+          showStatus($('service-status'), `已在文件管理器中打开：${directory}`, 'ok');
+        } catch (error) {
+          showStatus($('service-status'), String(error), 'error');
+        }
+      });
+
+      $('quit').addEventListener('click', () => invoke('quit_app'));
+
+      refresh().catch(error => {
+        $('subtitle').textContent = '无法读取设置';
+        showStatus($('update-status'), String(error), 'error');
+      });
+    </script>
+  </body>
+</html>

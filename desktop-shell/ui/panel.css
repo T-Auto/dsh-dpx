@@ -1,0 +1,232 @@
+/*
+ * Shared styling for the desktop shell's own windows (settings, first-close
+ * dialog). The palette and font stack mirror the DSH Web UI design tokens
+ * (`--dsw-alias-*` in packages/client/ui-theme) so these windows read as part of
+ * the same product, while staying standalone: they load before DSH is reachable
+ * and must not depend on it.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg-base: #ffffff;
+  --bg-layer-1: #ffffff;
+  --bg-layer-2: #ffffff;
+  --bg-layer-3: #ffffff;
+  --bg-module: rgb(245, 246, 247);
+  --label-primary: rgb(15, 17, 21);
+  --label-secondary: rgb(97, 102, 107);
+  --label-caption: rgb(173, 178, 184);
+  --border-l2: rgba(0, 0, 0, 0.1);
+  --border-l3: rgba(0, 0, 0, 0.12);
+  --border-l4: rgba(0, 0, 0, 0.16);
+  --brand: rgb(15, 17, 21);
+  --brand-label: #ffffff;
+  --accent: rgb(65, 118, 230);
+  --success: rgb(35, 150, 90);
+  --danger: rgb(199, 62, 62);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-code: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei";
+  --radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-base: rgb(21, 21, 23);
+    --bg-layer-1: rgb(35, 35, 36);
+    --bg-layer-2: rgb(44, 44, 46);
+    --bg-layer-3: rgb(53, 54, 56);
+    --bg-module: rgb(53, 54, 56);
+    --label-primary: rgb(249, 250, 251);
+    --label-secondary: rgb(207, 211, 214);
+    --label-caption: rgb(129, 133, 140);
+    --border-l2: rgba(255, 255, 255, 0.12);
+    --border-l3: rgba(255, 255, 255, 0.16);
+    --border-l4: rgba(255, 255, 255, 0.2);
+    --brand: rgb(249, 250, 251);
+    --brand-label: rgb(21, 21, 23);
+    --accent: rgb(103, 158, 254);
+    --success: rgb(86, 196, 133);
+    --danger: rgb(240, 130, 130);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  padding: 22px 24px 28px;
+  background: var(--bg-base);
+  color: var(--label-primary);
+  font: 14px/1.6 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+body.dialog { padding: 0; display: grid; place-items: center; min-height: 100vh; }
+
+h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+h2 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--label-caption);
+}
+
+.sub {
+  margin: 4px 0 20px;
+  color: var(--label-secondary);
+  font-size: 13px;
+}
+
+section {
+  margin-bottom: 14px;
+  padding: 16px 18px;
+  border: 1px solid var(--border-l2);
+  border-radius: var(--radius);
+  background: var(--bg-layer-1);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 28px;
+}
+
+.row + .row { margin-top: 4px; }
+
+.row .label { color: var(--label-secondary); font-size: 13px; flex: none; }
+
+.row .value {
+  font-family: var(--font-code);
+  font-size: 12px;
+  text-align: right;
+  word-break: break-all;
+  color: var(--label-primary);
+}
+
+.row .value.muted { color: var(--label-caption); font-family: var(--font); }
+
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 0;
+  cursor: pointer;
+  font-size: 13.5px;
+}
+
+.choice input { margin: 3px 0 0; accent-color: var(--accent); flex: none; }
+
+.choice .hint { display: block; color: var(--label-caption); font-size: 12px; }
+
+.hint { color: var(--label-caption); font-size: 12px; margin: 8px 0 0; }
+
+input[type="text"], input[type="url"] {
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-l3);
+  border-radius: 8px;
+  background: var(--bg-layer-2);
+  color: var(--label-primary);
+  font: 12.5px/1.5 var(--font-code);
+}
+
+input[type="text"]:focus, input[type="url"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.field { margin-top: 10px; }
+.field > span { display: block; color: var(--label-secondary); font-size: 12.5px; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+button {
+  padding: 7px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-l3);
+  background: transparent;
+  color: var(--label-primary);
+  font: 13px/1.4 var(--font);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+button:hover:not(:disabled) { background: var(--bg-module); }
+
+button.primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--brand-label);
+}
+
+button.primary:hover:not(:disabled) { opacity: 0.86; background: var(--brand); }
+
+button:disabled { opacity: 0.45; cursor: default; }
+
+.status {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-l2);
+  border-radius: 8px;
+  background: var(--bg-module);
+  color: var(--label-secondary);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.status.ok { color: var(--success); }
+.status.error { color: var(--danger); }
+.status[hidden] { display: none; }
+
+code {
+  font-family: var(--font-code);
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-module);
+  border: 1px solid var(--border-l2);
+}
+
+/* First-close dialog ------------------------------------------------ */
+
+.dialog-card {
+  width: min(440px, 100%);
+  margin: 18px;
+  padding: 22px 24px 20px;
+  border: 1px solid var(--border-l2);
+  border-radius: 14px;
+  background: var(--bg-layer-1);
+}
+
+.dialog-card h1 { font-size: 16px; }
+
+.dialog-card .sub { margin-bottom: 14px; }
+
+.dialog-options {
+  padding: 4px 0 2px;
+  border-top: 1px solid var(--border-l2);
+  border-bottom: 1px solid var(--border-l2);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}

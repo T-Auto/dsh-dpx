@@ -1,6 +1,6 @@
 [package]
 name = "dsh-dpx-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin desktop launcher for a dsh-dpx isolated environment"
 edition = "2021"
 rust-version = "1.77"
@@ -13,10 +13,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-single-instance = "2"
+# `tray-icon` + the image codecs are what the notification-area icon needs.
+tauri = { version = "2", features = ["tray-icon", "image-ico", "image-png"] }
+# NOTE: `tauri-plugin-single-instance` is deliberately NOT used. It keys its mutex
+# and its helper window on the bundle identifier, which is identical for every DPX
+# environment, so two environments could not run at the same time and starting one
+# raised the other's window. `src/instance.rs` implements the guard per environment.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+# Dependency-free update channel: rustls (default) + the Windows system proxy.
+ureq = { version = "3", features = ["win-system-proxy"] }
 
 [profile.release]
 panic = "abort"

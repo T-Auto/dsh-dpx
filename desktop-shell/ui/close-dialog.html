@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>关闭 DSH DeepSeek Harness Desktop</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body class="dialog">
+    <div class="dialog-card">
+      <h1>关闭窗口时要执行什么操作？</h1>
+      <p class="sub">DSH DeepSeek Harness Desktop · 隔离环境 <span id="environment">…</span></p>
+
+      <div class="dialog-options">
+        <label class="choice">
+          <input type="radio" name="close-action" value="tray" checked />
+          <span>缩小到右下角托盘图标并保持运行<span class="hint">DSH 继续在后台运行，托盘图标双击/左键可恢复窗口。</span></span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="close-action" value="exit" />
+          <span>关闭程序<span class="hint">停止该环境内的 DSH 服务并退出桌面封装。</span></span>
+        </label>
+      </div>
+
+      <label class="choice">
+        <input type="checkbox" id="remember" checked />
+        <span>下次不再提醒我<span class="hint">之后点击 □ X 直接执行上面的选择；随时可在托盘右键 → 设置 中修改。</span></span>
+      </label>
+
+      <div class="dialog-actions">
+        <button id="cancel">取消</button>
+        <button id="confirm" class="primary">确定</button>
+      </div>
+    </div>
+
+    <script>
+      const invoke = window.__TAURI__.core.invoke;
+      const $ = id => document.getElementById(id);
+      let busy = false;
+
+      function selected() {
+        return document.querySelector('input[name="close-action"]:checked')?.value ?? 'tray';
+      }
+
+      async function resolve(action) {
+        if (busy) return;
+        busy = true;
+        $('confirm').disabled = true;
+        $('cancel').disabled = true;
+        try {
+          await invoke('resolve_close_request', { action, remember: $('remember').checked });
+        } catch (error) {
+          document.querySelector('.dialog-card h1').textContent = `操作失败：${error}`;
+          busy = false;
+          $('confirm').disabled = false;
+          $('cancel').disabled = false;
+        }
+      }
+
+      $('confirm').addEventListener('click', () => resolve(selected()));
+      $('cancel').addEventListener('click', () => resolve('cancel'));
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') resolve('cancel');
+        if (event.key === 'Enter') resolve(selected());
+      });
+
+      invoke('desktop_environment').then(name => { $('environment').textContent = name; }).catch(() => {});
+      invoke('close_request_pending').catch(() => {});
+    </script>
+  </body>
+</html>

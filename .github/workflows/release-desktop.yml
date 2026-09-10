@@ -1,0 +1,92 @@
+name: Release desktop launcher
+
+# Publishes the Windows desktop launcher as its own GitHub Release channel,
+# independent of the dsh-dpx npm package version.
+#
+#   tag:    desktop-v<version>
+#   assets: DSH-DeepSeek-Harness-Desktop-<version>-x64.exe
+#           desktop-latest.json      (manifest consumed by dpx and the shell)
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Desktop artifact version (for example 0.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve the desktop version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $version = '${{ github.event.inputs.version }}'
+          } else {
+            $version = '${{ github.ref_name }}'.Substring('desktop-v'.Length)
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+') { throw "Invalid desktop version: $version" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Install the Tauri build dependencies
+        working-directory: desktop-shell
+        run: npm ci
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop-shell/src-tauri/target
+          key: ${{ runner.os }}-desktop-${{ hashFiles('desktop-shell/src-tauri/Cargo.lock') }}
+
+      - name: Build the launcher and its release manifest
+        shell: pwsh
+        run: >
+          ./scripts/build-desktop-launcher.ps1
+          -Version '${{ steps.version.outputs.version }}'
+          -SkipPackagedArtifact
+          -OutputDirectory dist
+
+      - name: Smoke-test the packaged manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content dist/desktop-latest.json -Raw | ConvertFrom-Json
+          $asset = Join-Path dist $manifest.assetName
+          if (-not (Test-Path $asset)) { throw "Missing release asset: $asset" }
+          $digest = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne $manifest.sha256) { throw "Digest mismatch: $digest != $($manifest.sha256)" }
+          if ((Get-Item $asset).Length -ne $manifest.size) { throw 'Size mismatch' }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = "desktop-v$version"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag (Join-Path dist '*') --clobber
+          } else {
+            gh release create $tag (Join-Path dist '*') `
+              --title "Desktop launcher $version" `
+              --notes "dsh-dpx desktop launcher $version. Update from the tray icon -> 设置 -> 检查更新, or run ``dpx desktop update --<environment>``."
+          }
