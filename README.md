@@ -83,8 +83,15 @@ D:\DevEnvs\Projects\dsh-environments\test\
 ├── appdata\ localappdata\ tmp\
 ├── workspace\                 # dpx 启动 DSH 时的工作目录
 ├── desktop\
-│   └── DSH DeepSeek Harness Desktop.exe
-│                              # 默认复制的 Windows 桌面启动器，可直接双击
+│   ├── DSH DeepSeek Harness Desktop.exe
+│   │                          # 默认复制的 Windows 桌面启动器，可直接双击
+│   └── .dpx-desktop.json      # dpx 记录的启动器版本/摘要，供更新检查使用
+├── desktop-state\             # 桌面启动器自己的状态（随环境隔离）
+│   ├── settings.json          # 关闭行为、更新源、托盘开关
+│   ├── shell.json             # 可选：启动契约（入口/参数/node），见下文
+│   ├── shell.log              # 启动器日志
+│   ├── updates\               # 更新暂存与被替换下来的旧 EXE
+│   └── webview2\              # WebView2 用户数据目录
 ├── dsh-distribution.json       # 环境的 dsh-distribution 描述符
 └── .dpx-environment.json       # 实例身份和 DPX 注册记录的本地副本
 ```
@@ -117,15 +124,44 @@ dpx npm install -g @deepseek-harness-tui/dsh-tui --test
 
 DPX v0.1 只接受 npm 的全局安装语义（`-g` / `--global`），并自行固定环境专属的 `--prefix`；调用者不能覆盖该 prefix。
 
-## Windows 桌面端（默认创建，可独立于 DSH 升级）
+## Windows 桌面端（默认创建，与 DSH 本体完全解耦）
 
 首次创建的每个 Windows 环境都包含：
 
 ```text
 <环境根>\desktop\DSH DeepSeek Harness Desktop.exe
+<环境根>\desktop\.dpx-desktop.json      # dpx 记录的启动器版本与 sha256
 ```
 
-双击该 EXE 后，它只从**自身路径的父目录**推导环境根（可用 `DSH_DESKTOP_ENV` 临时覆盖），再从该环境的 `npm-prefix\node_modules\@deepseek-ai\dsh\package.json` 动态读取 DSH 的 `bin` 入口。它不读取 DPX registry、不调用 `dpx`、不依赖 `D:\AIPC\dsh-desktop`，也不硬编码 DSH 的内部 `lib/bin.js` 位置。它会设置与 `dpx run` 相同的隔离变量并启动 `dsh web --no-open --port 0`；关闭窗口时回收启动的 DSH 子进程树。
+双击该 EXE 后，它只做四件事：
+
+1. 从**自身路径的父目录**推导环境根（可用 `DSH_DESKTOP_ENV` 临时覆盖）；
+2. 在该环境的 `npm-prefix\node_modules\<包名>\package.json` 里读取包自己声明的 `bin` 入口并启动它——**不硬编码** `lib/bin.js`、不读 DPX registry、不调用 `dpx`、不依赖任何 DSH 内部文件布局；
+3. 只从子进程输出中解析就绪 URL：优先取官方 `dsh web: <url>` 行，也接受任何回环地址 URL，因此 DSH 改写日志措辞不会让已安装的启动器失效；
+4. 关闭窗口默认**缩小到右下角托盘图标并继续运行**，托盘图标右键可打开设置或关闭程序。
+
+启动参数默认 `web --no-open --port 0`。如果将来 DSH 改变了入口位置或 CLI 参数形状，可以在环境根放一份启动契约，**无需重新编译启动器**：
+
+```jsonc
+// <环境根>\desktop-state\shell.json
+{
+  "dshPackage": "@deepseek-ai/dsh",
+  "dshEntry": "npm-prefix/node_modules/@deepseek-ai/dsh/lib/bin.js",
+  "launchArgs": ["web", "--no-open", "--port", "0"],
+  "node": "C:\\Program Files\\nodejs\\node.exe",
+  "extraEnv": { "EXAMPLE": "1" }
+}
+```
+
+因此“升级 DSH 本体”和“升级 desktop 封装”是两件互不影响的事：
+
+```bash
+# 只替换环境内的 DSH npm 包；不重建、不替换桌面启动器
+dpx npm install -g @deepseek-ai/dsh@latest --test
+
+# 只替换 desktop 封装（Windows 启动器）；不动 DSH 包
+dpx desktop update --test
+```
 
 因此，desktop 启动的 DSH 全局 `AGENTS.md` 也放在：
 
@@ -135,23 +171,77 @@ DPX v0.1 只接受 npm 的全局安装语义（`-g` / `--global`），并自行�
 
 desktop EXE 本身没有另一份独立的全局 Agent 指令文件。
 
-因此，后续升级核心版本仍是普通命令：
+EXE 本身不内嵌 Node 或 DSH，运行时需要已安装 Node.js 和 Windows WebView2（Windows 11 通常自带）。桌面外壳的可控状态也完全按环境隔离：设置位于 `<环境根>\desktop-state\settings.json`，启动日志位于 `<环境根>\desktop-state\shell.log`，更新暂存位于 `<环境根>\desktop-state\updates\`，WebView2 用户数据位于 `<环境根>\desktop-state\webview2`，不会使用共享的 `%LOCALAPPDATA%\dsh-dpx-desktop` 目录。
 
-```bash
-dpx npm install -g @deepseek-ai/dsh@latest --test
+### 关闭行为与托盘
+
+| 位置 | 行为 |
+| --- | --- |
+| 右上角 `□ X` | 按设置执行：**缩小到托盘图标并保持运行**（默认）/ 关闭程序 / 每次询问 |
+| 首次点击 `□ X` | 弹出与 Web UI 同风格的确认框：默认勾选“缩小到右下角托盘图标并保持运行”和“下次不再提醒我” |
+| 托盘图标左键 | 恢复主窗口 |
+| 托盘图标右键 | `打开主窗口` / `设置` / `重启 DSH 服务` / `关闭程序` |
+| `设置 → 关闭窗口` | 随时在“缩小到托盘图标 / 关闭程序 / 每次询问”之间切换 |
+
+“关闭程序”会回收该环境内的 DSH 子进程树；缩小到托盘只是隐藏窗口，DSH 仍在后台运行。
+
+### 环境之间的隔离（重要）
+
+每个环境的桌面启动器都是**同一个文件名、同一个可执行文件副本**，所以“多个环境互不影响”必须由启动器自己保证，而不是靠文件名区分。当前实现保证：
+
+| 资源 | 归属 | 说明 |
+| --- | --- | --- |
+| 单实例互斥 | 每个环境一份 | 用 `<环境根>\desktop-state\shell.lock` 的独占文件锁；**不使用** Tauri 单实例插件的全局互斥量（它按 bundle identifier 命名，会让不同环境互相排斥、并互相把窗口弹到前台） |
+| 第二次启动同一环境 | 恢复已有窗口 | 通过 `<环境根>\desktop-state\instance.json` 里的 `{pid, hwnd}` 还原窗口，绝不启动第二个 DSH 服务，避免污染同一 `DSH_HOME` |
+| 两个不同环境 | 可同时运行 | 互斥键来自环境根，环境 A 与 B 完全不知道对方存在 |
+| DSH 子进程生命周期 | 绑定启动器 | 子进程被放入一个 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 作业对象：启动器无论是正常退出、崩溃还是被任务管理器强杀，操作系统都会一并终止该 DSH 进程树，不会留下占用会话写句柄的孤儿进程 |
+| 设置 / 日志 / 托盘状态 / WebView2 数据 / 更新暂存 | 每个环境一份 | 全部位于 `<环境根>\desktop-state\`，不使用任何共享目录 |
+
+> 升级说明：`0.1.0` 的启动器使用 Tauri 单实例插件，因此**两个环境不能同时运行**（后启动的那个会立即退出，并把先启动的窗口弹到前台）。`0.2.0` 起改为上面的按环境隔离实现；旧环境的 EXE 用 `dpx desktop update --<环境名>` 升级即可。
+
+### 桌面封装的更新（GitHub Release）
+
+desktop 封装有自己独立的版本号与发布通道，不随 DSH 本体变化：
+
+```powershell
+# 查看当前环境的启动器版本与摘要
+dpx desktop status --test
+
+# 检查 GitHub Release 上是否有新版本（只读，不写任何文件）
+dpx desktop check --test
+
+# 下载、校验并替换启动器
+dpx desktop update --test
+
+# 为 --no-desktop 创建的环境补装启动器
+dpx desktop install --test
 ```
 
-该升级只替换环境内的 DSH npm 包；既不会重建桌面 EXE，也不会改变 EXE 所属环境。EXE 本身不内嵌 Node 或 DSH，运行时需要已安装 Node.js 和 Windows WebView2（Windows 11 通常自带）。桌面外壳的可控状态也完全按环境隔离：启动日志位于 `<环境根>\desktop-state\shell.log`，WebView2 用户数据位于 `<环境根>\desktop-state\webview2`，不会使用 `%LOCALAPPDATA%\dsh-dpx-desktop` 共享目录。
+也可以在托盘图标右键 → `设置` 中点击“检查更新 / 立即更新”。两条路径共用同一份清单契约，详见 [`docs/desktop-release.md`](docs/desktop-release.md)。
+
+默认源是 `github:T-Auto/dsh-dpx`（即 `https://github.com/T-Auto/dsh-dpx/releases/latest/download/desktop-latest.json`）。`--source` 也接受：
+
+```powershell
+dpx desktop update --test --source github:T-Auto/dsh-dpx@desktop-v0.2.0   # 指定 tag
+dpx desktop update --test --source https://example.com/desktop-latest.json # 自建清单
+dpx desktop update --test --source .\dist\desktop-latest.json              # 本地清单
+```
+
+下载内容必须通过清单里的 `size` 与 `sha256` 校验才会被安装；校验失败会拒绝安装并保留原启动器。需要代理时用 `--proxy`，或依赖环境里的 `HTTPS_PROXY` / `ALL_PROXY`（桌面端还会读取 Windows 系统代理）。
 
 环境描述符将 `./desktop` 声明为 DPX 专属桌面启动器目录（公共协议的受限相对路径语法不允许以含空格的 EXE 文件名作为资源位置）。
 
 源码中保留了透明、可复现的 Tauri 构建目录 `desktop-shell/`。发布包包含预构建 x64 EXE，因此普通 dpx 用户无需安装 Rust/Tauri；维护者需要重建时运行：
 
 ```powershell
+# 重建内置产物 assets\windows\DSH DeepSeek Harness Desktop.exe 与 desktop-manifest.json
 npm run desktop:build
+
+# 额外产出可发布的 Release 目录（版本化 EXE + desktop-latest.json）
+powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1 -Version 0.2.1 -OutputDirectory dist -SkipPackagedArtifact
 ```
 
-该脚本仅会话级启用 `D:\DevEnvs\Rust` 工具链，npm/Cargo 下载走 `http://127.0.0.1:7897`，并将产物写入 `assets\windows\DSH DeepSeek Harness Desktop.exe`。图标来源为 `whale-app-icon-512.png` 与 `whale-app-icon.ico`；后者会在构建时明确覆盖 Tauri 的 Windows 原生图标资源。
+该脚本会话级启用本机 `D:\DevEnvs\Rust` 工具链（若存在），下载走 `-Proxy` / `DPX_BUILD_PROXY`；版本号同时写入编译期常量（`DPX_DESKTOP_VERSION`），所以启动器总能报告自己的真实版本。图标来源为 `whale-app-icon.ico`，会在构建时明确覆盖 Tauri 的 Windows 原生图标资源。
 
 ## 启动隔离环境
 

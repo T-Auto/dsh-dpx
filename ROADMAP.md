@@ -85,8 +85,11 @@
 
 ```text
 <environment-root>/desktop-state/
-├── shell.log
-└── webview2/
+├── shell.log          # 启动器日志
+├── settings.json      # 关闭行为 / 托盘开关 / 更新源 / 最近一次更新检查
+├── shell.json         # 可选：启动契约（DSH 入口、启动参数、node）
+├── updates/           # 更新暂存与被替换下来的旧 EXE
+└── webview2/          # WebView2 user-data directory
 ```
 
 - EXE 继续仅由自身路径推导环境根，不引入 DPX registry 运行时依赖。
@@ -99,6 +102,71 @@
 - 两个环境的日志/WebView2 数据互不共享。
 - 删除一个环境不影响另一个环境的桌面端。
 - purge 后只保留 OS/第三方不可控状态，不保留 DPX 可控桌面状态。
+
+---
+
+## Milestone 4 — 桌面封装独立发布通道（已实现）
+
+desktop 启动器有独立于 DPX 发行版与 DSH 本体的版本号和发布通道，通过 GitHub
+Release 分发，契约见 [`docs/desktop-release.md`](docs/desktop-release.md)。
+
+### 实现结果
+
+- 发布 tag 为 `desktop-v<version>`，资产为版本化 EXE 与 `desktop-latest.json` 清单；
+- `dpx desktop status|check|update|install` 与桌面端托盘菜单里的“设置 → 检查更新”走同一份清单契约；
+- 下载内容必须通过 `size` 与 `sha256` 校验，校验失败拒绝安装并保留原启动器；
+- 更新时会先重命名正在运行的 EXE（Windows 允许重命名运行中的可执行文件），再放入新文件，并记录 `desktop/.dpx-desktop.json`；
+- `desktop-state/updates/` 的旧文件在下次启动时清理；
+- 发布源可用 `--source` / 设置窗口覆盖为指定 tag、自建清单 URL 或本地清单路径，便于离线验证。
+
+### 与 DSH 本体的边界
+
+启动器不内嵌 DSH，也不假设 DSH 的内部入口或输出格式：它读取包自己声明的
+`bin`，只解析 `dsh web: <url>` 这一公开就绪行（并容忍其他回环 URL 措辞）。
+因此升级 DSH 包与升级桌面封装互不影响，任一方都不需要重建另一方。
+
+### 验收与测试
+
+- `test/desktop-release.test.js`：源解析、版本比较、清单校验、重定向/分块/CONNECT
+  代理、摘要校验失败拒绝安装、无发行版时的降级行为、本地清单离线路径、CLI 黑盒。
+- `desktop-shell/src-tauri/src/update.rs`：版本比较、源解析、摘要规范化、相对资产解析。
+- `scripts/build-desktop-launcher.ps1 -OutputDirectory` 产出与发布流程一致的目录，
+  可在不触网的情况下用 `dpx desktop update --source <该目录>` 端到端验证。
+
+---
+
+## Milestone 5 — 环境之间的进程级隔离（已实现）
+
+所有环境共用同一份桌面启动器可执行文件，因此“隔离”不能靠文件名区分，必须由启动器
+自己保证。`0.1.0` 使用 Tauri 单实例插件，其互斥量与辅助窗口按 bundle identifier
+（`dev.dsh.dpx.desktop`）命名，导致：
+
+- 环境 A 正在运行时启动环境 B，B 会**立即退出**，并把 A 的窗口弹到前台；
+- 按镜像名（`DSH DeepSeek Harness Desktop.exe`）排查或结束进程时会误伤其他环境；
+- 启动器被强制结束后，DSH 子进程成为孤儿并继续占用该环境的会话写句柄，下一次启动
+  会以 `session … is already owned by an active write handle` 失败。
+
+### 实现结果
+
+1. 移除 `tauri-plugin-single-instance`，改为 `desktop-shell/src-tauri/src/instance.rs`：
+   互斥来自 `<环境根>\desktop-state\shell.lock` 的独占文件锁（`share_mode(0)`），
+   进程以任何方式结束都由操作系统释放，不会留下死锁；
+2. 同一环境的第二次启动读取 `desktop-state/instance.json` 的 `{pid, hwnd}`，
+   直接还原已有窗口后退出，不启动第二个 DSH 服务；
+3. `desktop-shell/src-tauri/src/job.rs`：DSH 子进程被放入
+   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 作业对象，启动器被强杀时子进程树一并终止，
+   不再产生占用会话锁的孤儿进程；
+4. 桌面端全部状态（设置、日志、instance、更新暂存、WebView2 数据）都位于
+   `<环境根>\desktop-state\`，不含任何共享目录。
+
+### 验收
+
+- `cargo test`：`instance` 的“两个环境可各自取得（Primary）”“记录读写与撤销”、
+  `job` 的创建与赋值路径。
+- 手工/脚本：两个不同环境同时运行互不干扰；同一环境重复启动只还原窗口；
+  强杀启动器后 DSH 子进程随之消失。
+- 测试脚本只按**可执行文件路径/命令行**匹配进程，禁止按镜像名匹配
+  （见 `test\smoke-close.ps1` 的 `Stop-Environment`）。
 
 ---
 
@@ -138,4 +206,8 @@
 
 1. 先完成 Milestone 1 的安全注销、purge、预览和 registry/discovery 生命周期测试。
 2. 再完成 Milestone 2，将桌面端可控状态迁入环境根。
-3. 最后补 Milestone 3 的只读诊断；不把诊断变成隐式修复或自动删除。
+3. 补 Milestone 4 的桌面封装独立发布通道（GitHub Release + 校验后替换），
+   使“升级 DSH”与“升级 desktop 封装”彻底分离。
+4. 补 Milestone 5 的进程级隔离（按环境的单实例互斥 + 子进程作业对象），
+   使多个环境可以安全地同时运行。
+5. 最后补 Milestone 3 的只读诊断；不把诊断变成隐式修复或自动删除。
