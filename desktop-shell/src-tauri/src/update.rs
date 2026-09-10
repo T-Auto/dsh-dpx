@@ -563,7 +563,12 @@ pub fn cleanup_updates(env_root: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_versions, is_absolute_path, normalize_sha256, parse_source, resolve_asset_url, Source, ReleaseManifest};
+    use super::{
+        apply, compare_versions, effective_proxy, fetch_manifest, installed_digest, is_absolute_path, launcher_path,
+        normalize_sha256, parse_source, read_installed_version, resolve_asset_url, ManifestError, ReleaseManifest, Source,
+        DEFAULT_SOURCE,
+    };
+    use crate::settings::Settings;
     use std::cmp::Ordering;
     use std::path::PathBuf;
 
@@ -626,5 +631,40 @@ mod tests {
         assert!(is_absolute_path(r"D:\releases\a.exe"));
         assert!(is_absolute_path("D:/releases/a.exe"));
         assert!(!is_absolute_path("a.exe"));
+    }
+
+    /// Not hermetic: exercises the real published channel exactly the way the
+    /// settings window does (manifest fetch, asset download, sha256 verification,
+    /// install into an environment, version stamp). Run it explicitly:
+    ///
+    ///   $env:DPX_TEST_PROXY='http://127.0.0.1:7897'
+    ///   cargo test -- --ignored --nocapture
+    ///
+    /// Without `DPX_TEST_PROXY` it goes direct, which is fine on an unrestricted
+    /// network and flaky on one that needs a proxy.
+    #[test]
+    #[ignore = "requires network access to the published release channel"]
+    fn the_live_channel_installs_a_verified_launcher() {
+        let proxy = std::env::var("DPX_TEST_PROXY").ok().filter(|value| !value.trim().is_empty());
+        let settings = Settings { update_proxy: proxy, ..Settings::default() };
+        let root = std::env::temp_dir().join(format!("dpx-desktop-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp environment");
+
+        let source = parse_source(DEFAULT_SOURCE).expect("default source");
+        let manifest = match fetch_manifest(&source, effective_proxy(&settings).as_deref()) {
+            Ok(manifest) => manifest,
+            Err(ManifestError::NotFound) => panic!("no desktop release is published yet"),
+            Err(ManifestError::Message(message)) => panic!("{message}"),
+        };
+        assert!(!manifest.version.is_empty(), "manifest version");
+        assert_eq!(manifest.sha256.len(), 64, "manifest digest");
+
+        let outcome = apply(&root, &settings).expect("apply");
+        assert_eq!(outcome.version, manifest.version);
+        assert_eq!(installed_digest(&root).as_deref(), Some(manifest.sha256.as_str()), "installed digest");
+        assert_eq!(read_installed_version(&root).as_deref(), Some(manifest.version.as_str()), "version stamp");
+        assert!(launcher_path(&root).is_file(), "launcher file");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
