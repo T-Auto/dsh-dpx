@@ -182,19 +182,59 @@ fn is_not_found(error: &ureq::Error) -> bool {
     matches!(error, ureq::Error::StatusCode(404))
 }
 
+/// Failures worth trying again: a stalled or reset connection, or a status the
+/// server says is temporary. Release downloads go through proxies and CDNs that
+/// occasionally stall, and one flake should not fail a user's update check.
+fn is_transient(message: &str) -> bool {
+    const MARKERS: [&str; 9] = [
+        "timed out", "timeout", "connection reset", "connection refused", "broken pipe",
+        "unexpected eof", "closed", "HTTP 408", "HTTP 5",
+    ];
+    let lowered = message.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lowered.contains(&marker.to_ascii_lowercase()))
+}
+
+fn with_retries<T>(what: &str, mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    const ATTEMPTS: u32 = 3;
+    let mut last = String::new();
+    for round in 0..ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(message) => {
+                let retryable = is_transient(&message);
+                last = message;
+                if !retryable || round + 1 == ATTEMPTS {
+                    break;
+                }
+                log_backoff(what, round + 1, &last);
+                std::thread::sleep(Duration::from_millis(700 * u64::from(round + 1)));
+            }
+        }
+    }
+    Err(last)
+}
+
+fn log_backoff(what: &str, round: u32, message: &str) {
+    if let Ok(root) = crate::env_root() {
+        crate::log_line(&root, &format!("{what}: transient failure (retry {round}): {message}"));
+    }
+}
+
 fn fetch_bytes(url: &str, proxy: Option<&str>) -> Result<Vec<u8>, String> {
-    let agent = agent(proxy)?;
-    let mut response = agent
-        .get(url)
-        .header("Accept", "application/octet-stream")
-        .call()
-        .map_err(|error| describe_error(&error, url))?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_ASSET_BYTES)
-        .read_to_vec()
-        .map_err(|error| format!("下载 {url} 失败：{error}"))
+    with_retries("desktop update download", || {
+        let agent = agent(proxy)?;
+        let mut response = agent
+            .get(url)
+            .header("Accept", "application/octet-stream")
+            .call()
+            .map_err(|error| describe_error(&error, url))?;
+        response
+            .body_mut()
+            .with_config()
+            .limit(MAX_ASSET_BYTES)
+            .read_to_vec()
+            .map_err(|error| format!("下载 {url} 失败：{error}"))
+    })
 }
 
 fn normalize_sha256(value: &str) -> Option<String> {
@@ -239,14 +279,20 @@ enum ManifestError {
 
 fn read_manifest(url: &str, proxy: Option<&str>) -> Result<ReleaseManifest, ManifestError> {
     let text = if url.starts_with("http://") || url.starts_with("https://") {
-        let agent = agent(proxy).map_err(ManifestError::Message)?;
-        match agent.get(url).header("Accept", "application/json").call() {
-            Ok(mut response) => response
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| ManifestError::Message(format!("读取 {url} 响应失败：{error}")))?,
-            Err(error) if is_not_found(&error) => return Err(ManifestError::NotFound),
-            Err(error) => return Err(ManifestError::Message(describe_error(&error, url))),
+        match with_retries("desktop update check", || {
+            let agent = agent(proxy)?;
+            match agent.get(url).header("Accept", "application/json").call() {
+                Ok(mut response) => response
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|error| format!("读取 {url} 响应失败：{error}")),
+                Err(error) if is_not_found(&error) => Err("__NOT_FOUND__".to_string()),
+                Err(error) => Err(describe_error(&error, url)),
+            }
+        }) {
+            Ok(text) => text,
+            Err(message) if message == "__NOT_FOUND__" => return Err(ManifestError::NotFound),
+            Err(message) => return Err(ManifestError::Message(message)),
         }
     } else {
         std::fs::read_to_string(url).map_err(|error| ManifestError::Message(format!("无法读取发布清单 {url}：{error}")))?

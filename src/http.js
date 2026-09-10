@@ -13,7 +13,9 @@ import { connect as connectTcp } from 'node:net';
 import { connect as connectTls } from 'node:tls';
 
 const DEFAULT_TIMEOUT = 60_000;
+const DEFAULT_RETRIES = 3;
 const DEFAULT_MAX_REDIRECTS = 5;
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_HEADER_BYTES = 64 * 1024;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024 * 1024;
 const PROXY_ENVIRONMENT_KEYS = [
@@ -27,6 +29,17 @@ export class HttpError extends Error {
     this.status = status;
     this.url = url;
   }
+}
+
+/**
+ * A failure that is worth trying again: a stalled or reset connection, or a
+ * server-side status that is expected to be temporary.
+ */
+export function isRetryable(error) {
+  if (!(error instanceof HttpError)) return false;
+  if (error.status !== undefined) return RETRYABLE_STATUS.has(error.status);
+  return /timed out|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|Connection closed|Connection failed|Cannot connect|Proxy connection timed out/i
+    .test(error.message);
 }
 
 /**
@@ -310,9 +323,28 @@ function requestOnce({ target, proxy, headers, timeout, maxBodyBytes }) {
 /**
  * GET a URL, following redirects, and return the whole body.
  *
+ * Transient failures are retried: publishing channels sit behind proxies and CDNs
+ * that occasionally stall or reset a connection, and a single flake should not
+ * turn "check for updates" into an error the user has to retry by hand.
+ *
  * @returns {Promise<{url: string, status: number, headers: Record<string,string>, body: Buffer}>}
  */
 export async function httpGet(url, options = {}) {
+  const { retries = DEFAULT_RETRIES, retryDelayMs = 750 } = options;
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await httpGetOnce(url, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt === retries || !isRetryable(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
+async function httpGetOnce(url, options = {}) {
   const {
     proxy,
     headers = {},
