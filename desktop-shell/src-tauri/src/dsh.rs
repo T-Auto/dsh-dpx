@@ -25,6 +25,25 @@ pub const DEFAULT_DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 pub const SHELL_CONFIG_NAME: &str = "shell.json";
 pub const DEFAULT_PORT: &str = "0";
 
+/// Variables the shell always removes from the DSH child process, even when the
+/// launcher itself inherited them.
+///
+/// `NODE_OPTIONS` / `NODE_PATH` would inject code into the child. The npm
+/// entries matter for the same reason in reverse: dsh-dpx stopped redirecting
+/// npm's defaults through `NPM_CONFIG_PREFIX` / `NPM_CONFIG_CACHE`, so a stale
+/// copy inherited from an older launcher, a host shell, or a parent process must
+/// not leak into the child and silently retarget `npm` again. The environment's
+/// own `<env-root>/dsh-home/AGENTS.md` tells an agent to pass an explicit
+/// `--prefix` / `--cache` (or to use `dpx npm install`) instead.
+pub const SCRUBBED_ENV: [&str; 6] = [
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NPM_CONFIG_PREFIX",
+    "npm_config_prefix",
+    "NPM_CONFIG_CACHE",
+    "npm_config_cache",
+];
+
 /// Optional, shell-owned launch contract: `<env-root>/desktop-state/shell.json`.
 ///
 /// ```json
@@ -339,6 +358,19 @@ mod tests {
         for key in ["NPM_CONFIG_PREFIX", "NPM_CONFIG_CACHE", "npm_config_prefix", "npm_config_cache"] {
             assert!(env.iter().all(|(name, _)| name != key), "runtime env must not set {key}");
         }
+    }
+
+    #[test]
+    fn stale_npm_config_is_scrubbed_from_the_child() {
+        use super::SCRUBBED_ENV;
+        // Asserting on the set rather than on a single call keeps the launch path
+        // honest: `lib.rs` must remove every key listed here, and an inherited
+        // copy of the old dpx redirect must never reach the DSH child.
+        for key in ["NPM_CONFIG_PREFIX", "npm_config_prefix", "NPM_CONFIG_CACHE", "npm_config_cache"] {
+            assert!(SCRUBBED_ENV.contains(&key), "{key} must be scrubbed from the child environment");
+        }
+        assert!(SCRUBBED_ENV.contains(&"NODE_OPTIONS"));
+        assert!(SCRUBBED_ENV.contains(&"NODE_PATH"));
     }
 
     #[test]

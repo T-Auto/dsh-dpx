@@ -520,8 +520,9 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.env_remove("NODE_OPTIONS");
-    cmd.env_remove("NODE_PATH");
+    for key in dsh::SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
     for (key, value) in plan.env.iter() {
         cmd.env(key, value);
     }
