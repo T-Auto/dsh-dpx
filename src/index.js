@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, installBundledDesktopLauncher } from './desktop-release.js';
+import { ensureEnvironmentGuide } from './environment-guide.js';
 
 export const FORMAT = 1;
 export const DPX_API_VERSION = 'dpx.dsh.dev/v1alpha1';
@@ -131,6 +132,26 @@ async function ensureEnvironmentDirectories(paths, platform) {
   }
 }
 
+/**
+ * Write the environment-level DSH instruction file (`dsh-home/AGENTS.md`).
+ *
+ * Every launch path points `DSH_HOME` at that directory, so this single file
+ * reaches an agent started through `dpx run` (Web or TUI), through the desktop
+ * launcher, and through any future launcher that honors `DSH_HOME`. It states
+ * which environment is running, how the layout is arranged, and that npm keeps
+ * its native meaning — installing into the environment requires an explicit
+ * `--prefix` and `--cache` (or `dpx npm install`).
+ */
+async function writeEnvironmentGuide(paths, { name, instanceId }) {
+  return ensureEnvironmentGuide(paths, { name, instanceId, version: DISTRIBUTION.version });
+}
+
+/** Repair/refresh the parts of an existing environment that are generated. */
+async function ensureEnvironmentScaffold(paths, record, platform) {
+  await ensureEnvironmentDirectories(paths, platform);
+  await writeEnvironmentGuide(paths, { name: record.name, instanceId: record.instance?.instanceId });
+}
+
 export function environmentDescriptor({ desktop = false } = {}) {
   const resources = [
     resource('npm-prefix', 'extensions', './npm-prefix', 'nonportable'),
@@ -251,7 +272,7 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
       // Also repair environments created before the isolated Windows profile
       // folders were initialized. This makes the fix effective without asking
       // users to remove and recreate an existing environment.
-      await ensureEnvironmentDirectories(pathsFor(existing.root), platform);
+      await ensureEnvironmentScaffold(pathsFor(existing.root), existing, platform);
       return existing;
     }
     if (existsSync(root)) {
@@ -284,6 +305,7 @@ export async function createEnvironment({ name, storageRoot, home = defaultRegis
     };
     await atomicJson(paths.descriptor, environmentDescriptor({ desktop: installDesktop }));
     if (installDesktop) await installPackagedDesktopLauncher(root);
+    await writeEnvironmentGuide(paths, { name, instanceId });
     await atomicJson(paths.manifest, record);
     registry.environments.push(record);
     registry.revision += 1;
@@ -315,9 +337,10 @@ export async function resolveEnvironment(name, home = defaultRegistryHome()) {
   const record = registry.environments.find(row => row.name === name);
   if (!record) throw new Error(`Environment --${name} is not registered. Create it with: dpx npm install -g @deepseek-ai/dsh --${name} --<absolute-storage-root>`);
   if (!existsSync(record.root)) throw new Error(`Environment --${name} is registered but its root is missing: ${record.root}`);
-  // Repair profile directories for environments created by older dpx versions
-  // before a caller launches npm, dsh, or the desktop shell.
-  await ensureEnvironmentDirectories(pathsFor(record.root), process.platform);
+  // Repair what an environment created by an older dpx version is missing —
+  // profile directories and the generated instruction file — before a caller
+  // launches npm, dsh, the TUI, or the desktop shell.
+  await ensureEnvironmentScaffold(pathsFor(record.root), record, process.platform);
   return record;
 }
 
@@ -343,7 +366,16 @@ export function npmCliPath(node = process.execPath) {
   return candidate;
 }
 
-export function npmEnvironment(paths, inherited = process.env) {
+/**
+ * Environment for an npm child process that dpx itself starts.
+ *
+ * npm's target is expressed with **explicit command-line flags** (`--prefix`,
+ * `--cache`, see `npmInstallArguments`) instead of `NPM_CONFIG_*`. dsh-dpx does
+ * not silently redefine what `npm` means: an isolated environment must not make
+ * a plain `npm install -g` elsewhere behave differently. Inherited npm config
+ * that would retarget the install is dropped for the same reason.
+ */
+export function npmEnvironment(inherited = process.env) {
   const env = { ...inherited };
   delete env.NODE_OPTIONS;
   delete env.NODE_PATH;
@@ -351,17 +383,21 @@ export function npmEnvironment(paths, inherited = process.env) {
   // never silently depends on a host-local proxy. An operator can explicitly
   // pass npm's --proxy / --https-proxy flags for a single install command.
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NPM_CONFIG_PROXY', 'NPM_CONFIG_HTTPS_PROXY', 'npm_config_proxy', 'npm_config_https_proxy']) delete env[key];
-  env.NPM_CONFIG_CACHE = paths.npmCache;
-  env.npm_config_cache = paths.npmCache;
-  env.NPM_CONFIG_PREFIX = paths.npmPrefix;
-  env.npm_config_prefix = paths.npmPrefix;
-  env.NPM_CONFIG_UPDATE_NOTIFIER = 'false';
-  env.npm_config_update_notifier = 'false';
+  for (const key of ['NPM_CONFIG_PREFIX', 'npm_config_prefix', 'NPM_CONFIG_CACHE', 'npm_config_cache', 'NPM_CONFIG_UPDATE_NOTIFIER', 'npm_config_update_notifier']) delete env[key];
   return env;
 }
 
+/**
+ * The isolated environment variables every child DSH/TUI process receives.
+ *
+ * Note what is deliberately *absent*: no `NPM_CONFIG_PREFIX` and no
+ * `NPM_CONFIG_CACHE`. npm keeps its native defaults inside the environment, and
+ * the generated `dsh-home/AGENTS.md` tells an agent to use an explicit
+ * `--prefix` / `--cache` (or `dpx npm install`) when it really means this
+ * environment.
+ */
 export function runtimeEnvironment(paths, inherited = process.env) {
-  const env = npmEnvironment(paths, inherited);
+  const env = npmEnvironment(inherited);
   env.DSH_HOME = paths.dshHome;
   env.DSH_AGENTS_HOME = paths.agentsHome;
   env.DSH_TELEMETRY_DISABLED = '1';
@@ -486,14 +522,24 @@ export function isGlobalInstall(args) {
   return args.includes('-g') || args.includes('--global');
 }
 
-export function npmInstallArguments(args, prefix) {
+/**
+ * Complete an npm global install's target with explicit flags.
+ *
+ * `--prefix` and `--cache` are passed on the command line rather than through
+ * `NPM_CONFIG_*`, so dpx never changes what `npm` means for anything else that
+ * runs in the same environment.
+ */
+export function npmInstallArguments(args, prefix, cache) {
   if (!isGlobalInstall(args)) throw new Error('dpx only accepts npm global installs. Include -g or --global.');
   if (args.some(arg => arg === '--prefix' || arg.startsWith('--prefix='))) throw new Error('dpx owns npm --prefix; do not override it.');
+  if (cache !== undefined && args.some(arg => arg === '--cache' || arg.startsWith('--cache='))) throw new Error('dpx owns npm --cache; do not override it.');
   const hasProxy = args.some(arg => arg === '--proxy' || arg.startsWith('--proxy='));
   const hasHttpsProxy = args.some(arg => arg === '--https-proxy' || arg.startsWith('--https-proxy='));
   return [
     ...args,
-    '--prefix', prefix, '--no-audit', '--no-fund',
+    '--prefix', prefix,
+    ...(cache === undefined ? [] : ['--cache', cache]),
+    '--no-audit', '--no-fund',
     ...(hasProxy ? [] : ['--proxy=null']),
     ...(hasHttpsProxy ? [] : ['--https-proxy=null']),
   ];

@@ -21,7 +21,7 @@ npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui
 
 此命令会在**全局 DeepSeek Harness** 上安装 DSH 与 TUI 启动器；TUI 首次运行时会通过 DSH 的插件机制写入默认的全局 DSH profile。它适合只有一个日常 DSH 环境的用户。
 
-`dsh-dpx` 的定位不同：它是管理多个隔离 DSH 发行环境的**包管理器/环境管理器**。它可以经由 npm/npx 直接拉取，也可以从本仓库本地构建、链接和运行。每个环境独立拥有 npm 全局前缀、下载缓存、DSH 状态、agents/skills、工作目录和环境描述符；安装到 `test` 不会改变全局 DSH，也不会改变 `stable`。
+`dsh-dpx` 的定位不同：它是管理多个隔离 DSH 发行环境的**包管理器/环境管理器**。它可以经由 npm/npx 直接拉取，也可以从本仓库本地构建、链接和运行。每个环境独立拥有 npm 全局前缀、下载缓存、DSH 状态、agents/skills、工作目录和环境描述符；安装到 `test` 不会改变全局 DSH，也不会改变 `stable`。环境里的 `npm` 保持原生行为，要写进环境必须显式给出 `--prefix` / `--cache`（或直接用 `dpx npm install`），并且每个环境都会自动得到一份说明自己在哪、怎么设计的 `dsh-home\AGENTS.md`。
 
 ## 安装 dpx
 
@@ -73,10 +73,10 @@ dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --"D:\D
 
 ```text
 D:\DevEnvs\Projects\dsh-environments\test\
-├── npm-prefix\                # test 专属的 npm 全局包与命令 shim
-├── npm-cache\                 # test 专属的 npm 下载/内容缓存
+├── npm-prefix\                # test 专属的 npm 全局包与命令 shim（需显式 --prefix 才会写入）
+├── npm-cache\                 # test 专属的 npm 下载/内容缓存（需显式 --cache 才会写入）
 ├── dsh-home\                  # test 专属 DSH_HOME：profiles、设置、会话、存储
-│   └── AGENTS.md              # test 环境的用户全局 DSH 指令（可选）
+│   └── AGENTS.md              # dpx 自动写入的环境级全局指令（TUI / Web / 桌面端都会读）
 ├── agents-home\               # test 专属 DSH_AGENTS_HOME：agents / skills
 ├── home\
 │   └── Desktop\               # Windows 首次建立工作区使用的默认位置
@@ -122,7 +122,7 @@ dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test
 dpx npm install -g @deepseek-harness-tui/dsh-tui --test
 ```
 
-DPX v0.1 只接受 npm 的全局安装语义（`-g` / `--global`），并自行固定环境专属的 `--prefix`；调用者不能覆盖该 prefix。
+DPX v0.1 只接受 npm 的全局安装语义（`-g` / `--global`），并自行固定环境专属的 `--prefix` 与 `--cache`；调用者不能覆盖这两个值。这两个旗标是**命令行显式参数**，DPX 不通过 `NPM_CONFIG_*` 改写 npm 的默认行为（原因见[「npm 在隔离环境里是原生的」](#npm-在隔离环境里是原生的)）。
 
 ## Windows 桌面端（默认创建，与 DSH 本体完全解耦）
 
@@ -169,7 +169,7 @@ dpx desktop update --test
 <环境根>\dsh-home\AGENTS.md
 ```
 
-desktop EXE 本身没有另一份独立的全局 Agent 指令文件。
+这份文件由 `dpx` 自动写入（内容见[「环境级 `AGENTS.md`」](#环境级-agentsmddpx-自动写入所有启动方式都会读到)），桌面端、TUI 与 Web 读的是同一份；desktop EXE 本身没有另一份独立的全局 Agent 指令文件。
 
 EXE 本身不内嵌 Node 或 DSH，运行时需要已安装 Node.js 和 Windows WebView2（Windows 11 通常自带）。桌面外壳的可控状态也完全按环境隔离：设置位于 `<环境根>\desktop-state\settings.json`，启动日志位于 `<环境根>\desktop-state\shell.log`，更新暂存位于 `<环境根>\desktop-state\updates\`，WebView2 用户数据位于 `<环境根>\desktop-state\webview2`，不会使用共享的 `%LOCALAPPDATA%\dsh-dpx-desktop` 目录。
 
@@ -263,10 +263,12 @@ dpx run --test dsh --version
 ```text
 DSH_HOME=<环境根>\dsh-home
 DSH_AGENTS_HOME=<环境根>\agents-home
-NPM_CONFIG_PREFIX
-NPM_CONFIG_CACHE
 HOME / USERPROFILE / APPDATA / LOCALAPPDATA / TEMP / TMP
+XDG_CONFIG_HOME / XDG_CACHE_HOME / XDG_DATA_HOME
+PATH=<环境根>\npm-prefix;…
 ```
+
+注意这里**没有** `NPM_CONFIG_PREFIX` / `NPM_CONFIG_CACHE`：dsh-dpx 不再劫持 npm 的默认值（见下文[「npm 在隔离环境里是原生的」](#npm-在隔离环境里是原生的)）。
 
 其中两者职责不同：
 
@@ -297,25 +299,68 @@ npm install -g pnpm
 corepack enable pnpm
 ```
 
+### npm 在隔离环境里是原生的
+
+隔离环境**不劫持 npm**：dsh-dpx（`dpx run`）与桌面启动器都不再设置 `NPM_CONFIG_PREFIX` / `NPM_CONFIG_CACHE`，`npm` 在环境里就是原生命令行。
+
+- `npm install -g <pkg>`、`npm root -g`、`npm config get cache` 读写的都是**宿主机**的全局 prefix / 缓存，
+  **不会**装进、也不会改变这个隔离环境；
+- 所以要往环境里装东西，必须显式给出路径与缓存：
+
+  ```powershell
+  npm install -g --prefix "<环境根>\npm-prefix" --cache "<环境根>\npm-cache" <包名>
+  ```
+
+  或使用等价的封装（推荐，dpx 内部就是把这两个旗标拼上去）：
+
+  ```powershell
+  dpx npm install -g <包名> --test
+  ```
+
+  `dpx npm install` 只接受全局安装语义（`-g` / `--global`），并自行固定 `--prefix` 与 `--cache`；调用者不能覆盖这两个值。这样即使宿主或其他工具设置了 `NPM_CONFIG_*`，dpx 的一次安装也不会被静默改道。
+
+之所以改成显式旗标，是因为“环境变量重定向 npm 默认值”这种收容方式会让**同一台机器上的其他 npm 调用**也被改道：只要从隔离环境里派生的任何进程执行 `npm i -g`，它就会装进隔离环境而不是宿主全局目录——这既反直觉，也让宿主全局 npm 目录变得难以解释。现在只有显式写路径的那条命令会写进环境。
+
+> 已存在的环境：`dpx run` 用的是 dpx 自己的代码，升级 dpx 后立即生效；桌面端是独立二进制，需要用 `dpx desktop update --<环境名>` 换上包含该修改的版本。旧 EXE 在被替换前仍会设置这两个变量（此时 `--prefix` / `--cache` 的显式写法依然有效，只是裸跑 `npm` 的默认落点仍在环境内）。环境级 `AGENTS.md` 里也写明了这条自查方法。
+
+### 环境级 `AGENTS.md`（dpx 自动写入，所有启动方式都会读到）
+
+创建环境时（以及每次复用/升级已有环境时），dpx 会写入并刷新：
+
+```text
+<环境根>\dsh-home\AGENTS.md
+```
+
+内容由环境自身布局生成，包含：
+
+- **你在哪个隔离环境里运行**：环境名、环境根、`DSH_HOME`、本文件位置；
+- **这个隔离环境是怎么设计的**：`npm-prefix` / `npm-cache` / `dsh-home` / `agents-home` / `home` / `appdata` / `tmp` / `xdg-*` / `workspace` / `desktop` 各是什么、哪个环境变量指向它；
+- **npm 的行为**：正常 `npm install -g` 改变的是宿主全局目录、不会改变本环境，要装进本环境必须 `--prefix` + `--cache`（或 `dpx npm install`），并给出可直接复制的命令；
+- **边界**：隔离只收容默认解析、不是沙箱，以及不要动其他环境。
+
+因为 `DSH_HOME` 指向该目录，**不管环境是怎么启动的**——`dpx run --test dsh web`、`dpx run --test dsh-tui`、还是双击 `<环境根>\desktop\DSH DeepSeek Harness Desktop.exe`——DSH 都会把这同一个文件当作环境级全局指令读进来。
+
+该文件由 dpx 托管：`<!-- dpx:environment-guide:begin … -->` 与 `<!-- dpx:environment-guide:end -->` 之间的内容会自动刷新，你自己写的全局指令放在标记块之外即可，不会被覆盖。用 `--no-desktop` 创建的环境同样会得到这个文件。
+
 ### 隔离的边界：收容「默认解析」，不是写入沙箱
 
-`runtimeEnvironment()` 保证的是**默认路径解析**落在环境内。只要调用方不显式指定绝对路径，npm、pnpm、DSH 与各类工具的默认读写都会落在 `<环境根>` 下：
+`runtimeEnvironment()` 保证的是**默认路径解析**落在环境内。只要调用方不显式指定绝对路径，pnpm、DSH 与各类工具的默认读写都会落在 `<环境根>` 下：
 
 | 资源 | 环境内位置 |
 | --- | --- |
-| npm 全局 prefix / cache | `<环境根>\npm-prefix`、`<环境根>\npm-cache` |
-| pnpm store | `<环境根>\xdg-data\pnpm\store` |
 | 用户 home | `<环境根>\home`（同时作为 `HOME` / `USERPROFILE`） |
 | `APPDATA` / `LOCALAPPDATA` / `TEMP` | `<环境根>\appdata`、`<环境根>\localappdata`、`<环境根>\tmp` |
 | XDG 三件套 | `<环境根>\xdg-config`、`<环境根>\xdg-cache`、`<环境根>\xdg-data` |
+| pnpm store | `<环境根>\xdg-data\pnpm\store` |
 | DSH 状态与配置 | `<环境根>\dsh-home`、`<环境根>\agents-home` |
+| npm 全局 prefix / cache | **不自动收容**：需要显式 `--prefix` / `--cache`（见上一节） |
 
 三条命令即可确认当前的实际落点：
 
 ```powershell
-npm root -g      # <环境根>\npm-prefix\node_modules
 pnpm store path  # <环境根>\xdg-data\pnpm\store\v11
 $HOME            # <环境根>\home
+npm root -g      # 宿主全局 root（%APPDATA%\npm\node_modules），不是环境内
 ```
 
 但隔离的机制是**环境变量重定向**，不是文件系统边界。以下三点不在保证范围内：
@@ -326,12 +371,11 @@ $HOME            # <环境根>\home
 | `PATH` 是**前置**而非替换 | `env.PATH = [paths.npmPrefix, inherited.PATH]` | 环境内没有的工具会静默回落到宿主的同名二进制。环境内只装了 `dsh` 时，`dsh-tui`、`pnpm` 很可能解析到 `%APPDATA%\npm` 下的宿主副本 |
 | 无写入拦截 | DPX 是环境管理器，不挂文件过滤驱动 | 拥有写权限的进程仍可写宿主任意绝对路径 |
 
-受 `PATH` 回落影响时注意：**二进制所在位置 ≠ 安装目标位置**。宿主那份 `pnpm` 执行时仍读取上述环境变量，因此它的 store 与 global prefix 依然落在环境内。
+`PATH` 前置只是让**已经显式装进环境**的二进制优先解析，并不改变 npm 的默认安装目标。想确认某个工具来自环境内还是宿主，看 `Get-Command <名字>` 解析到的路径，不要看版本号。
 
 实践建议：
 
-- 要严格隔离，就不要向 `dpx run` 的命令传递宿主绝对路径，让默认解析生效。
-- 想确认某个工具来自环境内还是宿主，看 `Get-Command <名字>` 解析到的路径，不要看版本号。
+- 要往环境里装包，永远写全 `--prefix` 与 `--cache`，或用 `dpx npm install -g <包名> --<环境名>`。
 - 需要真正的文件系统边界时，请在本机沙箱／容器层面实现；DPX 只负责环境身份、受控布局与默认路径收容。
 
 ## `dsh-tui --test` 统一启动体验
@@ -356,7 +400,7 @@ dsh-tui --test
 1. 解析开头的 `--<环境名>`，如 `--test`；其余参数仍是普通 TUI 参数；
 2. 读取 `HKCU\Software\DSH\DPX`，只接受 `Profile=dpx.dsh.dev/v1alpha1`；
 3. 读取并校验指向的 DPX `registry.json`，精确匹配环境名；**禁止扫盘**，也不能执行 registry 提供的任意命令；
-4. 由环境 root 推导固定子路径（`npm-prefix`、`dsh-home`、`agents-home` 和已知的 TUI `bin/dsh-tui.js`），设置同样的隔离变量后委托；
+4. 由环境 root 推导固定子路径（`npm-prefix`、`dsh-home`、`agents-home` 和已知的 TUI `bin/dsh-tui.js`），设置同样的隔离变量（`DSH_HOME` / `DSH_AGENTS_HOME` / 隔离 profile 目录；**不设置** `NPM_CONFIG_*`）后委托；
 5. 找不到 DPX/环境/TUI 时给出 `dpx run --test dsh-tui`、创建环境或安装 TUI 的明确提示。
 
 在该适配器合并到 `dsh-tui` 前，等价且已验证的命令是：

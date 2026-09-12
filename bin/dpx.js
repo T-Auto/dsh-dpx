@@ -52,11 +52,11 @@ async function npmCommand(args, home, environment) {
     record = await resolveEnvironment(parsed.name, home);
   }
   const paths = pathsFor(record.root);
-  const argsForNpm = npmInstallArguments(parsed.passthrough, paths.npmPrefix);
+  const argsForNpm = npmInstallArguments(parsed.passthrough, paths.npmPrefix, paths.npmCache);
   const npmCli = environment.DPX_NPM_CLI?.trim() || npmCliPath();
   const result = await runChild(process.execPath, [npmCli, 'install', ...argsForNpm], {
     cwd: paths.workspace,
-    env: npmEnvironment(paths, environment),
+    env: npmEnvironment(environment),
   });
   return result.code;
 }

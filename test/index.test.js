@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,7 @@ import {
   resolveEnvironment,
   runtimeEnvironment,
 } from '../src/index.js';
+import { environmentGuidePath } from '../src/environment-guide.js';
 
 test('parses the requested npm syntax with name and absolute storage root', () => {
   const parsed = parseEnvironmentArguments([
@@ -128,20 +129,73 @@ test('builds npm and DSH environments rooted wholly in the selected environment'
   const record = await createEnvironment({ name: 'qa', storageRoot: storage, home, publishDiscovery: false });
   const paths = pathsFor(record.root);
   assert.equal(isGlobalInstall(['install', '-g', 'x']), true);
-  assert.deepEqual(npmInstallArguments(['-g', 'x'], paths.npmPrefix), ['-g', 'x', '--prefix', paths.npmPrefix, '--no-audit', '--no-fund', '--proxy=null', '--https-proxy=null']);
   assert.deepEqual(
-    npmInstallArguments(['-g', 'x', '--proxy=http://127.0.0.1:7897', '--https-proxy=http://127.0.0.1:7897'], paths.npmPrefix),
-    ['-g', 'x', '--proxy=http://127.0.0.1:7897', '--https-proxy=http://127.0.0.1:7897', '--prefix', paths.npmPrefix, '--no-audit', '--no-fund'],
+    npmInstallArguments(['-g', 'x'], paths.npmPrefix, paths.npmCache),
+    ['-g', 'x', '--prefix', paths.npmPrefix, '--cache', paths.npmCache, '--no-audit', '--no-fund', '--proxy=null', '--https-proxy=null'],
   );
-  assert.throws(() => npmInstallArguments(['x'], paths.npmPrefix), /global installs/);
-  const env = runtimeEnvironment(paths, { PATH: 'host-path', NODE_OPTIONS: '--evil', NODE_PATH: 'bad', HTTPS_PROXY: 'http://127.0.0.1:7897', npm_config_proxy: 'http://127.0.0.1:7897' });
+  assert.deepEqual(
+    npmInstallArguments(['-g', 'x', '--proxy=http://127.0.0.1:7897', '--https-proxy=http://127.0.0.1:7897'], paths.npmPrefix, paths.npmCache),
+    ['-g', 'x', '--proxy=http://127.0.0.1:7897', '--https-proxy=http://127.0.0.1:7897', '--prefix', paths.npmPrefix, '--cache', paths.npmCache, '--no-audit', '--no-fund'],
+  );
+  assert.throws(() => npmInstallArguments(['x'], paths.npmPrefix, paths.npmCache), /global installs/);
+  assert.throws(() => npmInstallArguments(['-g', 'x', '--cache=C:\\other'], paths.npmPrefix, paths.npmCache), /owns npm --cache/);
+  const env = runtimeEnvironment(paths, { PATH: 'host-path', NODE_OPTIONS: '--evil', NODE_PATH: 'bad', HTTPS_PROXY: 'http://127.0.0.1:7897', npm_config_proxy: 'http://127.0.0.1:7897', NPM_CONFIG_PREFIX: 'C:\\host-prefix' });
   assert.equal(env.DSH_HOME, paths.dshHome);
   assert.equal(env.DSH_AGENTS_HOME, paths.agentsHome);
-  assert.equal(env.NPM_CONFIG_CACHE, paths.npmCache);
-  assert.equal(env.NPM_CONFIG_PREFIX, paths.npmPrefix);
   assert.equal(env.DSH_TELEMETRY_DISABLED, '1');
   assert.equal(env.NODE_OPTIONS, undefined);
   assert.equal(env.NODE_PATH, undefined);
   assert.equal(env.HTTPS_PROXY, undefined);
   assert.equal(env.npm_config_proxy, undefined);
+});
+
+test('never hijacks npm defaults for a dsh/tui child process', async () => {
+  const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+  const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+  const record = await createEnvironment({ name: 'native', storageRoot: storage, home, publishDiscovery: false, desktop: false });
+  const paths = pathsFor(record.root);
+  const env = runtimeEnvironment(paths, {});
+  for (const key of ['NPM_CONFIG_PREFIX', 'NPM_CONFIG_CACHE', 'npm_config_prefix', 'npm_config_cache']) {
+    assert.equal(env[key], undefined, `runtime env must not set ${key}`);
+  }
+  assert.equal(env.PATH.split(process.platform === 'win32' ? ';' : ':')[0], paths.npmPrefix);
+});
+
+test('writes and refreshes the environment-level AGENTS.md that every launcher reads', async () => {
+  const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+  const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+  const record = await createEnvironment({ name: 'guide', storageRoot: storage, home, publishDiscovery: false, desktop: false });
+  const paths = pathsFor(record.root);
+  assert.equal(existsSync(paths.desktop), false);
+  const guide = join(paths.dshHome, 'AGENTS.md');
+  assert.equal(existsSync(guide), true);
+  assert.equal(environmentGuidePath(paths), guide);
+  const text = await readFile(guide, 'utf8');
+  assert.match(text, /dsh-dpx/);
+  assert.match(text, /--prefix/);
+  assert.match(text, /--cache/);
+  assert.ok(text.includes(paths.npmPrefix));
+  assert.ok(text.includes(paths.npmCache));
+  assert.ok(text.includes(paths.root));
+  assert.ok(text.includes('guide'));
+  // Reusing the environment refreshes the managed block instead of appending it twice.
+  await resolveEnvironment('guide', home);
+  const refreshed = await readFile(guide, 'utf8');
+  assert.equal(refreshed, text);
+  assert.equal(refreshed.split('<!-- dpx:environment-guide:begin').length - 1, 1);
+});
+
+test('keeps instructions a user wrote outside the managed AGENTS.md block', async () => {
+  const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+  const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+  const record = await createEnvironment({ name: 'custom', storageRoot: storage, home, publishDiscovery: false, desktop: false });
+  const paths = pathsFor(record.root);
+  const guide = join(paths.dshHome, 'AGENTS.md');
+  await writeFile(guide, '# 我自己的全局规则\n\n总是用中文回答。\n');
+  const second = await createEnvironment({ name: 'custom', storageRoot: storage, home, publishDiscovery: false, desktop: false });
+  assert.equal(second.name, 'custom');
+  const text = await readFile(guide, 'utf8');
+  assert.match(text, /总是用中文回答。/);
+  assert.equal(text.split('<!-- dpx:environment-guide:begin').length - 1, 1);
+  assert.ok(text.indexOf('总是用中文回答。') < text.indexOf('<!-- dpx:environment-guide:begin'));
 });

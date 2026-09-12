@@ -19,7 +19,7 @@ test('dpx cli installs into the selected isolated npm prefix without network', a
   const registry = join(work, 'registry');
   const fakeNpm = join(work, 'fake-npm.js');
   const capture = join(work, 'npm-capture.json');
-  await writeFile(fakeNpm, `import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path';\nconst args=process.argv.slice(2); const prefix=args[args.indexOf('--prefix')+1]; await mkdir(join(prefix,'node_modules','@deepseek-ai','dsh'),{recursive:true}); await writeFile(join(prefix,'node_modules','@deepseek-ai','dsh','package.json'),'{}'); await writeFile(process.env.CAPTURE,JSON.stringify({args, env:{cache:process.env.NPM_CONFIG_CACHE,prefix:process.env.NPM_CONFIG_PREFIX,nodeOptions:process.env.NODE_OPTIONS,httpsProxy:process.env.HTTPS_PROXY,npmProxy:process.env.npm_config_proxy}}));`);
+  await writeFile(fakeNpm, `import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path';\nconst args=process.argv.slice(2); const prefix=args[args.indexOf('--prefix')+1]; const cache=args[args.indexOf('--cache')+1]; await mkdir(join(prefix,'node_modules','@deepseek-ai','dsh'),{recursive:true}); await writeFile(join(prefix,'node_modules','@deepseek-ai','dsh','package.json'),'{}'); await writeFile(process.env.CAPTURE,JSON.stringify({args, env:{cache:process.env.NPM_CONFIG_CACHE,prefix:process.env.NPM_CONFIG_PREFIX,argCache:cache,nodeOptions:process.env.NODE_OPTIONS,httpsProxy:process.env.HTTPS_PROXY,npmProxy:process.env.npm_config_proxy}}));`);
   const result = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--test', `--${storage}`], {
     DPX_HOME: registry,
     DPX_NPM_CLI: fakeNpm,
@@ -32,8 +32,11 @@ test('dpx cli installs into the selected isolated npm prefix without network', a
   assert.equal(result.status, 0, result.stderr);
   const root = join(storage, 'dsh-environments', 'test');
   const captured = JSON.parse(await readFile(capture, 'utf8'));
-  assert.equal(captured.env.prefix, join(root, 'npm-prefix'));
-  assert.equal(captured.env.cache, join(root, 'npm-cache'));
+  // npm is native: the target is expressed with flags, never with NPM_CONFIG_*.
+  assert.equal(captured.env.prefix, undefined);
+  assert.equal(captured.env.cache, undefined);
+  assert.equal(captured.args[captured.args.indexOf('--prefix') + 1], join(root, 'npm-prefix'));
+  assert.equal(captured.env.argCache, join(root, 'npm-cache'));
   assert.equal(captured.env.nodeOptions, undefined);
   assert.equal(captured.env.httpsProxy, undefined);
   assert.equal(captured.env.npmProxy, undefined);
@@ -42,6 +45,10 @@ test('dpx cli installs into the selected isolated npm prefix without network', a
   assert.ok(captured.args.includes('--https-proxy=null'));
   assert.ok(captured.args.includes('--no-fund'));
   assert.ok(existsSync(join(root, 'npm-prefix', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')));
+  // The environment-level instruction file is written for every launch path.
+  const guide = await readFile(join(root, 'dsh-home', 'AGENTS.md'), 'utf8');
+  assert.ok(guide.includes(join(root, 'npm-prefix')));
+  assert.ok(guide.includes(join(root, 'npm-cache')));
   const listed = run(['env', 'list'], { DPX_HOME: registry });
   assert.equal(listed.status, 0, listed.stderr);
   assert.equal(JSON.parse(listed.stdout).environments[0].name, 'test');

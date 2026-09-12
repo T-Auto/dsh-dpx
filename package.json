@@ -23,7 +23,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "npm run test && node --check bin/dpx.js && node --check src/index.js && node --check src/http.js && node --check src/desktop-release.js",
+    "check": "npm run test && node --check bin/dpx.js && node --check src/index.js && node --check src/http.js && node --check src/desktop-release.js && node --check src/environment-guide.js",
     "desktop:build": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1",
     "desktop:pack": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1 -OutputDirectory dist -SkipPackagedArtifact",
     "desktop:publish": "powershell -ExecutionPolicy Bypass -File scripts/publish-desktop-release.ps1 -Directory dist",
