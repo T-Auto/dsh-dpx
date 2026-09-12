@@ -534,16 +534,46 @@ fn same_file(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// How long the detached helper waits before relaunching: enough for this
+/// process to exit and release the per-environment single-instance lock.
+pub const RELAUNCH_WAIT_TICKS: u32 = 4;
+
+/// The command line handed to `cmd.exe /C` by [`schedule_relaunch`].
+///
+/// `ping` is the portable sleep (this must work with no console and no
+/// PowerShell policy assumptions); `start ""` detaches the relaunch so it does
+/// not die with this process. Both paths are quoted for **cmd**, not for the C
+/// runtime — see [`schedule_relaunch`].
+pub fn relaunch_command_line(launcher: &Path, wait_ticks: u32) -> String {
+    format!("/C ping -n {wait_ticks} 127.0.0.1 >NUL & start \"\" \"{}\"", launcher.display())
+}
+
 /// Start a detached helper that waits for this process to exit, then relaunches
 /// the (now replaced) launcher.
+///
+/// The command line is appended with `raw_arg` on purpose. `Command::args`
+/// quotes arguments for the **C runtime** convention, where an embedded `"` is
+/// escaped as `\"` — but `cmd.exe` parses its own command line and does not know
+/// that escape, so `start "" "C:\… with spaces\…exe"` arrived mangled and Windows
+/// answered with `Windows cannot find '\'`. Passing the line verbatim is the only
+/// form cmd is guaranteed to read as written.
 fn schedule_relaunch(launcher: &Path) -> Result<(), String> {
-    let command = format!("ping -n 4 127.0.0.1 >NUL & start \"\" \"{}\"", launcher.display());
+    schedule_relaunch_after(launcher, RELAUNCH_WAIT_TICKS)
+}
+
+fn schedule_relaunch_after(launcher: &Path, wait_ticks: u32) -> Result<(), String> {
+    let line = relaunch_command_line(launcher, wait_ticks);
     let mut process = Command::new("cmd.exe");
-    process.args(["/C", &command]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    process.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        process.raw_arg(&line);
         process.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    #[cfg(not(windows))]
+    {
+        process.arg(&line);
     }
     process.spawn().map(|_| ()).map_err(|error| format!("无法安排重启：{error}"))
 }
@@ -631,6 +661,40 @@ mod tests {
         assert!(is_absolute_path(r"D:\releases\a.exe"));
         assert!(is_absolute_path("D:/releases/a.exe"));
         assert!(!is_absolute_path("a.exe"));
+    }
+
+    /// The relaunch helper must survive a launcher path with spaces.
+    ///
+    /// This is a real end-to-end check of the cmd command line (it spawns the
+    /// same helper `apply` uses and waits for the marker the target writes), not
+    /// a string assertion: the 0.2.2 release shipped a line that looked correct
+    /// but reached `cmd.exe` mangled, and Windows answered with
+    /// `Windows cannot find '\'` while the update itself had already succeeded.
+    #[cfg(windows)]
+    #[test]
+    fn the_relaunch_helper_starts_a_target_whose_path_contains_spaces() {
+        use super::{relaunch_command_line, schedule_relaunch_after};
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!("dpx relaunch test {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir with a space");
+        let marker = root.join("relaunched.txt");
+        let target = root.join("fake launcher.cmd");
+        std::fs::write(&target, format!("@echo off\r\necho ok> \"{}\"\r\n", marker.display())).expect("write target");
+
+        // The production line, only with a shorter wait so the test stays quick.
+        let line = relaunch_command_line(&target, 1);
+        assert!(line.contains("start \"\""), "cmd needs an explicit empty title: {line}");
+        schedule_relaunch_after(&target, 1).expect("spawn relaunch helper");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let started = marker.is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(started, "the relaunch helper never started {target:?} (command line: {line})");
     }
 
     /// Not hermetic: exercises the real published channel exactly the way the
