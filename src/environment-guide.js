@@ -68,18 +68,25 @@ export function renderEnvironmentGuide(paths, { name, version } = {}) {
 ## npm 在这里是原生的（重要）
 
 dsh-dpx 不劫持 npm：\`dpx run\` 与桌面启动器都不设置 \`NPM_CONFIG_PREFIX\` / \`NPM_CONFIG_CACHE\`，
-\`npm\` 就是原生命令行。
+\`npm\` 完全按原生规则工作。而本环境的 \`APPDATA\` / \`LOCALAPPDATA\` 本身是被隔离的，
+所以 npm 的原生默认落点也在环境内 —— 只是落在**另一个**目录，不是 dpx 管理的那个：
+
+| 你问的 | 答案 |
+| --- | --- |
+| \`npm prefix -g\` / \`npm root -g\` | \`${paths.appData}\\npm\`（原生默认 = \`%APPDATA%\\npm\`） |
+| \`npm config get cache\` | \`${paths.localAppData}\\npm-cache\`（= \`%LOCALAPPDATA%\\npm-cache\`） |
+| dpx / DSH 真正使用的环境 npm 目录（\`PATH\` 第一项，\`dsh\`、\`dsh-tui\` 所在处） | \`${prefix}\` |
+| dpx 管理的环境 npm 缓存 | \`${cache}\` |
 
 > 自查：\`$env:NPM_CONFIG_PREFIX\`、\`$env:NPM_CONFIG_CACHE\` 应当为空。
-> 若仍有值，说明本环境的桌面启动器还是旧版本（它硬编码了这两个变量），
-> 用 \`dpx desktop update --${name_}\` 升级启动器并重启即可消失；在那之前它们只会把 npm 的
-> 默认落点指到本环境——下面显式写 \`--prefix\` / \`--cache\` 的写法在两种情况下都成立。
+> 若仍有值，说明本环境的桌面启动器还是旧版本（它硬编码了这两个变量）；
+> 用 \`dpx desktop update --${name_}\` 升级启动器并重启即可消失。
 
-- \`npm install -g <pkg>\`、\`npm root -g\`、\`npm config get cache\` 读写的都是**宿主机**的全局目录，
-  **不会**装进、也不会改变当前隔离环境。
-- 所以不要假定“默认就装进本环境”；反过来，在环境里裸跑 npm 影响的是宿主机全局目录，不是别的环境。
+- 裸跑 \`npm install -g <pkg>\` 不会污染宿主机（profile 被隔离），但它装进 \`${paths.appData}\\npm\`：
+  那个目录**不在 \`PATH\` 上**，也不是 \`dpx\`、DSH 或桌面端查找包的位置 —— 装在那里等于没人看得见。
+- 所以别把 \`npm root -g\` 的输出当成“已经装进环境”的证据：它指向 \`appdata\\npm\`，不是 \`npm-prefix\`。
 
-要把包安装进**这个环境**，必须显式给出路径与缓存：
+要把包安装进**这个环境**（能被 \`dpx run\`、\`dsh\`、桌面端看到），必须显式给出路径与缓存：
 
 \`\`\`powershell
 npm install -g --prefix "${prefix}" --cache "${cache}" <包名>
