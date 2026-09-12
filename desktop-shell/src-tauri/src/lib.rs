@@ -651,7 +651,7 @@ fn log_path(root: &Path) -> PathBuf {
     settings::logs_path(root)
 }
 
-fn log_line(root: &Path, message: &str) {
+pub fn log_line(root: &Path, message: &str) {
     let path = log_path(root);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

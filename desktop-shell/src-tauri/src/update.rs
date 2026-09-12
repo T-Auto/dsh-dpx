@@ -519,7 +519,14 @@ pub fn apply(env_root: &Path, settings: &Settings) -> Result<ApplyOutcome, Strin
 
     let restart = running_here;
     if restart {
-        schedule_relaunch(&launcher)?;
+        // Record the handover in `desktop-state/shell.log`: the relaunch is the
+        // one step of an update the user cannot see, and its failure used to look
+        // like a successful update followed by an unexplained error dialog.
+        crate::log_line(env_root, &format!("relaunching after updating to {}", manifest.version));
+        if let Err(error) = schedule_relaunch(&launcher) {
+            crate::log_line(env_root, &format!("could not schedule the relaunch: {error}"));
+            return Err(error);
+        }
     }
     Ok(ApplyOutcome { version: manifest.version, launcher: launcher.display().to_string(), restart })
 }
