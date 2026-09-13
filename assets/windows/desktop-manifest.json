@@ -2,11 +2,11 @@
     "schemaVersion":  1,
     "kind":  "DPXDesktopRelease",
     "channel":  "desktop",
-    "version":  "0.2.4",
-    "tag":  "desktop-v0.2.4",
+    "version":  "0.2.5",
+    "tag":  "desktop-v0.2.5",
     "platform":  "win32-x64",
     "assetName":  "DSH DeepSeek Harness Desktop.exe",
-    "sha256":  "3613f08b49ee7f0dc93f4b7d630e931ca2057c74fadc472451f5124eff58d18b",
-    "size":  4676608,
-    "builtAt":  "2026-09-12T07:58:41Z"
+    "sha256":  "d05861da553441e81d0af57897b6b02c8978f24edb172bd7e3727abe70de7655",
+    "size":  4678144,
+    "builtAt":  "2026-09-13T07:52:58Z"
 }
