@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
@@ -78,4 +78,131 @@ test('dpx rejects reuse before a named environment is registered', async () => {
   const result = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--test'], { DPX_HOME: join(work, 'registry') });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /not registered/);
+});
+
+/**
+ * One environment shaped like a real one: a "global" copy of each launch target
+ * in `npm-prefix`, plus an ambient PATH that either keeps the environment first
+ * or leaks a host shim ahead of it.
+ */
+async function environmentFixture() {
+  const work = await mkdtemp(join(tmpdir(), 'dpx-cli-'));
+  const storage = join(work, 'storage');
+  const registry = join(work, 'registry');
+  const fakeNpm = join(work, 'fake-npm.js');
+  const root = join(storage, 'dsh-environments', 'test');
+  await writeFile(fakeNpm, `import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path';\nconst args=process.argv.slice(2); const prefix=args[args.indexOf('--prefix')+1]; for (const [name, version] of [['@deepseek-ai/dsh','1.2.3'],['@deepseek-harness-tui/dsh-tui','0.10.0']]) { const dir=join(prefix,'node_modules',...name.split('/')); await mkdir(dir,{recursive:true}); await writeFile(join(dir,'package.json'),JSON.stringify({name,version,bin:{}})); }`);
+  const installed = run(['npm', 'install', '-g', '@deepseek-ai/dsh', '--test', `--${storage}`], {
+    DPX_HOME: registry,
+    DPX_NPM_CLI: fakeNpm,
+    DPX_DISABLE_DISCOVERY: '1',
+  });
+  assert.equal(installed.status, 0, installed.stderr);
+  const hostShim = join(work, 'host-shims');
+  await mkdir(hostShim, { recursive: true });
+  await writeFile(join(hostShim, 'dsh.cmd'), '@echo off\r\n');
+  await writeFile(join(hostShim, 'dsh-tui.cmd'), '@echo off\r\n');
+  const nodeDir = dirname(process.execPath);
+  const cleanPath = [join(root, 'npm-prefix'), nodeDir, 'C:\\Windows'].join(';');
+  const leakedPath = [hostShim, nodeDir, join(root, 'npm-prefix'), 'C:\\Windows'].join(';');
+  return { work, registry, root, hostShim, cleanPath, leakedPath };
+}
+
+test('dpx which answers "which copy would run" without running it', async () => {
+  const fixture = await environmentFixture();
+  const clean = run(['which', '--test'], { DPX_HOME: fixture.registry, PATH: fixture.cleanPath });
+  assert.equal(clean.status, 0, clean.stderr);
+  const report = JSON.parse(clean.stdout);
+  assert.equal(report.environment, 'test');
+  assert.equal(report.targets[0].verdict, 'clean');
+  assert.equal(report.targets[0].isolated.present, true);
+  assert.equal(report.targets[0].isolated.version, '1.2.3');
+  assert.match(report.targets[0].isolated.via, /dpx run --test dsh/);
+
+  const leaked = run(['which', '--test', 'dsh'], { DPX_HOME: fixture.registry, PATH: fixture.leakedPath });
+  assert.equal(leaked.status, 0, leaked.stderr);
+  const single = JSON.parse(leaked.stdout);
+  assert.equal(single.target, 'dsh');
+  assert.equal(single.verdict, 'host-leak');
+  assert.equal(single.ambientPath[0].file, join(fixture.hostShim, 'dsh.cmd'));
+  assert.ok(single.advice.includes(join(fixture.hostShim, 'dsh.cmd')));
+
+  const unknown = run(['which', '--test', 'nope'], { DPX_HOME: fixture.registry, PATH: fixture.cleanPath });
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /Unsupported launch target/);
+});
+
+test('dpx env doctor exits non-zero exactly when the environment is not self-consistent', async () => {
+  const fixture = await environmentFixture();
+  const clean = run(['env', 'doctor', '--test'], { DPX_HOME: fixture.registry, PATH: fixture.cleanPath });
+  assert.equal(clean.status, 0, clean.stderr);
+  const report = JSON.parse(clean.stdout);
+  assert.equal(report.ok, true);
+  assert.equal(report.summary.errors, 0);
+  assert.equal(report.registry, fixture.registry);
+  assert.equal(report.checks.find(row => row.id === 'registry-binding').status, 'ok');
+  assert.equal(report.checks.find(row => row.id === 'environment-guide').status, 'ok');
+
+  const leaked = run(['env', 'doctor', '--test'], { DPX_HOME: fixture.registry, PATH: fixture.leakedPath });
+  assert.equal(leaked.status, 1);
+  const broken = JSON.parse(leaked.stdout);
+  assert.equal(broken.ok, false);
+  const shadowed = broken.checks.find(row => row.id === 'path-shadowing:dsh');
+  assert.equal(shadowed.status, 'error');
+  assert.ok(shadowed.fix.includes('dpx run --test dsh'));
+});
+
+test('dpx env use prints a script for the current shell, and blocks nothing', async () => {
+  const fixture = await environmentFixture();
+  const powershell = run(['env', 'use', '--test', '--format', 'powershell'], { DPX_HOME: fixture.registry });
+  assert.equal(powershell.status, 0, powershell.stderr);
+  assert.ok(powershell.stdout.includes(`$env:DSH_HOME = '${join(fixture.root, 'dsh-home')}'`));
+  assert.ok(powershell.stdout.includes(`$env:DSH_DPX_ENV_ROOT = '${fixture.root}'`));
+  assert.ok(powershell.stdout.includes(`$env:DPX_HOME = '${fixture.registry}'`));
+  assert.ok(powershell.stdout.includes(`$env:PATH = '${join(fixture.root, 'npm-prefix')}' + ';' + $env:PATH`));
+
+  const json = run(['env', 'use', '--test', '--format', 'json'], { DPX_HOME: fixture.registry });
+  assert.equal(JSON.parse(json.stdout).envRoot, fixture.root);
+
+  const bad = run(['env', 'use', '--test', '--format', 'nushell'], { DPX_HOME: fixture.registry });
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /Unsupported shell format/);
+});
+
+test('dpx exec runs an arbitrary command inside the environment', async () => {
+  const fixture = await environmentFixture();
+  const result = run(
+    ['exec', '--test', '--', process.execPath, '-e', 'process.stdout.write([process.env.DSH_HOME, process.env.DSH_DPX_ENV_ROOT, process.env.DSH_DPX_ENV].join("|"))'],
+    { DPX_HOME: fixture.registry, PATH: fixture.cleanPath },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, [join(fixture.root, 'dsh-home'), fixture.root, 'test'].join('|'));
+
+  // `--cwd` is honoured, and the default is the environment workspace.
+  const cwd = run(['exec', '--test', '--cwd', fixture.work, '--', process.execPath, '-e', 'process.stdout.write(process.cwd())'], { DPX_HOME: fixture.registry, PATH: fixture.cleanPath });
+  assert.equal(cwd.stdout, fixture.work);
+
+  const noCommand = run(['exec', '--test', '--'], { DPX_HOME: fixture.registry, PATH: fixture.cleanPath });
+  assert.notEqual(noCommand.status, 0);
+  assert.match(noCommand.stderr, /dpx exec --<name>/);
+});
+
+test('dpx plugin add pins the store the profile is already linked from', async () => {
+  const fixture = await environmentFixture();
+  const profile = join(fixture.root, 'dsh-home', 'profiles', 'web');
+  await mkdir(join(profile, 'node_modules'), { recursive: true });
+  await writeFile(join(profile, 'node_modules', '.modules.yaml'), 'storeDir: C:\\host-store\\v11\nlayoutVersion: 5\n');
+
+  const dryRun = run(['plugin', 'add', '--test', 'some-plugin', '--profile', 'web', '--dry-run'], { DPX_HOME: fixture.registry });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.equal(plan.profile, 'web');
+  assert.equal(plan.store.path, 'C:\\host-store\\v11');
+  assert.equal(plan.store.source, 'existing-node_modules');
+  assert.ok(plan.command.includes('--store-dir C:\\host-store\\v11'));
+  assert.equal(plan.dryRun, true);
+
+  const missingSpec = run(['plugin', 'add', '--test', '--profile', 'web'], { DPX_HOME: fixture.registry });
+  assert.notEqual(missingSpec.status, 0);
+  assert.match(missingSpec.stderr, /at least one package spec/);
 });
