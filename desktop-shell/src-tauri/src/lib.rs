@@ -162,7 +162,7 @@ fn webui_status(state: tauri::State<'_, AppState>) -> Status {
 
 #[tauri::command]
 fn desktop_environment() -> String {
-    env_root().map(|root| environment_name(&root)).unwrap_or_else(|_| "desktop".to_string())
+    env_root().map(|root| dsh::environment_name(&root)).unwrap_or_else(|_| "desktop".to_string())
 }
 
 #[tauri::command]
@@ -217,7 +217,7 @@ fn desktop_info(app: tauri::AppHandle) -> Result<DesktopInfo, String> {
     };
     Ok(DesktopInfo {
         shell_version: env!("DPX_DESKTOP_BUILD_VERSION").to_string(),
-        environment: environment_name(&root),
+        environment: dsh::environment_name(&root),
         environment_root: root.display().to_string(),
         state_dir: settings::state_dir(&root).display().to_string(),
         log_path: settings::logs_path(&root).display().to_string(),
@@ -378,6 +378,45 @@ fn open_state_dir() -> Result<String, String> {
     Ok(directory.display().to_string())
 }
 
+/// Open a terminal that is *inside* this environment.
+///
+/// The launcher is the one place where "inside the environment" is certain: it
+/// derived the environment root from its own location and applies the same
+/// [`dsh::runtime_env`] the DSH child receives. A terminal opened here is a
+/// concrete, testable answer to "which copy am I using?", instead of rules the
+/// operator has to remember — and it is the desktop-side counterpart of
+/// `dpx env use`.
+#[tauri::command]
+fn open_environment_shell() -> Result<String, String> {
+    let root = env_root()?;
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).map_err(|error| format!("无法创建工作目录：{error}"))?;
+    let name = dsh::environment_name(&root);
+    let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+    let mut cmd = Command::new(comspec);
+    cmd.arg("/k")
+        .arg(format!("title dsh-dpx {name}"))
+        .current_dir(&workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for key in dsh::SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
+    for (key, value) in dsh::runtime_env(&root) {
+        cmd.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
+    }
+    let child = cmd.spawn().map_err(|error| format!("无法打开环境终端：{error}"))?;
+    log_line(&root, &format!("opened an environment shell (pid {}) in {}", child.id(), workspace.display()));
+    Ok(workspace.display().to_string())
+}
+
 pub fn run() {
     update_cleanup_on_start();
     tauri::Builder::default()
@@ -394,7 +433,8 @@ pub fn run() {
             close_request_pending,
             resolve_close_request,
             quit_app,
-            open_state_dir
+            open_state_dir,
+            open_environment_shell
         ])
         .setup(|app| {
             let state = app.state::<AppState>().inner().clone();
@@ -637,10 +677,6 @@ fn navigate(app: &tauri::AppHandle, url: &str) {
             }
         }
     });
-}
-
-fn environment_name(root: &Path) -> String {
-    root.file_name().and_then(|name| name.to_str()).unwrap_or("desktop").to_string()
 }
 
 fn webview_data_dir(root: &Path) -> PathBuf {

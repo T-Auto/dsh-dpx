@@ -50,11 +50,13 @@
       <h2>服务</h2>
       <div class="actions">
         <button id="restart">重启 DSH 服务</button>
+        <button id="open-shell">在本环境中打开终端</button>
         <button id="open-state">打开状态目录</button>
         <button id="quit" class="primary">关闭程序</button>
       </div>
       <div class="status" id="service-status" hidden></div>
       <p class="hint" id="log-hint">日志：—</p>
+      <p class="hint">“环境终端”里的 <code>PATH</code> / <code>DSH_HOME</code> / <code>DSH_DPX_ENV</code> 与桌面端启动 DSH 时完全一致，用来确认一条命令到底命中哪一套副本。</p>
     </section>
 
     <script>
@@ -160,6 +162,15 @@
         try {
           const directory = await invoke('open_state_dir');
           showStatus($('service-status'), `已在文件管理器中打开：${directory}`, 'ok');
+        } catch (error) {
+          showStatus($('service-status'), String(error), 'error');
+        }
+      });
+
+      $('open-shell').addEventListener('click', async () => {
+        try {
+          const workspace = await invoke('open_environment_shell');
+          showStatus($('service-status'), `已在新窗口打开环境终端，工作目录：${workspace}`, 'ok');
         } catch (error) {
           showStatus($('service-status'), String(error), 'error');
         }

@@ -25,6 +25,29 @@ pub const DEFAULT_DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 pub const SHELL_CONFIG_NAME: &str = "shell.json";
 pub const DEFAULT_PORT: &str = "0";
 
+/// Environment identity handed to the DSH child, and to every shell opened in
+/// the environment.
+///
+/// `DSH_HOME` tells DSH where its state lives, but nothing outside DSH reads it,
+/// and "the host" and "an environment" are indistinguishable from it alone. These
+/// two variables name the environment and its root, so any process started here
+/// — including a `dpx` an agent runs inside the environment — can answer "which
+/// environment am I in?" without inferring it from a path. dpx reads them to
+/// find the one registry that owns every environment on this machine, which the
+/// environment's isolated `LOCALAPPDATA` would otherwise hide.
+pub const ENVIRONMENT_VARIABLE: &str = "DSH_DPX_ENV";
+pub const ENVIRONMENT_ROOT_VARIABLE: &str = "DSH_DPX_ENV_ROOT";
+
+/// The environment's name, which is also its directory name.
+pub fn environment_name(env_root: &Path) -> String {
+    env_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("desktop")
+        .to_string()
+}
+
 /// Variables the shell always removes from the DSH child process, even when the
 /// launcher itself inherited them.
 ///
@@ -238,6 +261,8 @@ pub fn runtime_env(env_root: &Path) -> Vec<(String, OsString)> {
     let mut vars: Vec<(String, OsString)> = vec![
         ("DSH_HOME".into(), dir("dsh-home")),
         ("DSH_AGENTS_HOME".into(), dir("agents-home")),
+        (ENVIRONMENT_VARIABLE.into(), OsString::from(environment_name(env_root))),
+        (ENVIRONMENT_ROOT_VARIABLE.into(), env_root.as_os_str().to_os_string()),
         ("HOME".into(), dir("home")),
         ("USERPROFILE".into(), dir("home")),
         ("APPDATA".into(), dir("appdata")),
@@ -313,7 +338,10 @@ pub fn extract_url(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_launch_args, extract_url, runtime_env, trim_url_token};
+    use super::{
+        default_launch_args, environment_name, extract_url, runtime_env, trim_url_token,
+        ENVIRONMENT_ROOT_VARIABLE, ENVIRONMENT_VARIABLE,
+    };
     use std::path::Path;
 
     #[test]
@@ -358,6 +386,19 @@ mod tests {
         for key in ["NPM_CONFIG_PREFIX", "NPM_CONFIG_CACHE", "npm_config_prefix", "npm_config_cache"] {
             assert!(env.iter().all(|(name, _)| name != key), "runtime env must not set {key}");
         }
+    }
+
+    #[test]
+    fn runtime_environment_names_the_environment_it_isolates() {
+        let root = Path::new(r"C:\environments\desktop");
+        let env = runtime_env(root);
+        let lookup = |key: &str| env.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        // dpx and the agent inside both need to answer "which environment is
+        // this?" without inferring it from DSH_HOME.
+        assert_eq!(lookup(ENVIRONMENT_VARIABLE).unwrap(), std::ffi::OsString::from("desktop"));
+        assert_eq!(lookup(ENVIRONMENT_ROOT_VARIABLE).unwrap(), root.as_os_str().to_os_string());
+        assert_eq!(environment_name(root), "desktop");
+        assert_eq!(environment_name(Path::new("/")), "desktop");
     }
 
     #[test]
