@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, installBundledDesktopLauncher } from './desktop-release.js';
-import { GUIDE_FORMAT, ensureEnvironmentGuide, environmentGuidePath } from './environment-guide.js';
+import { ENVIRONMENT_MANIFEST_NAME, GUIDE_FORMAT, ensureEnvironmentGuide, environmentGuidePath } from './environment-guide.js';
 
 export const FORMAT = 1;
 export const DPX_API_VERSION = 'dpx.dsh.dev/v1alpha1';
@@ -67,6 +67,60 @@ export function windowsDiscoveryRegistryPath(platform = process.platform) {
 }
 
 /**
+ * Which managed environment this process is running inside, derived from
+ * evidence rather than from a single variable.
+ *
+ * `DSH_DPX_ENV_ROOT` is the direct answer, but it is not always visible: DSH's
+ * shell/terminal layer rebuilds the `DSH_*` namespace for the processes it hands
+ * to an agent, and anything not declared there — including dpx's own identity
+ * variables — is dropped before the agent's commands ever see it. Measured, not
+ * assumed: inside a dpx-hosted desktop environment the agent's shell sees
+ * `DSH_HOME` but neither `DSH_DPX_ENV_ROOT` nor even `DSH_AGENTS_HOME`.
+ *
+ * So the fallback is evidence a stripped environment cannot fake: `DSH_HOME` (or
+ * the isolated `LOCALAPPDATA`) sitting next to a `.dpx-environment.json` that
+ * declares `kind: DPXEnvironment`. A host shell has neither, and a directory
+ * that merely happens to be called `dsh-home` is not enough.
+ *
+ * @returns `{ root, source, name }`, or undefined when this is not a dpx
+ *   environment at all.
+ */
+export function environmentRootFromProcess(env = process.env, platform = process.platform) {
+  const declared = env[DPX_ENV_ROOT_VARIABLE]?.trim();
+  if (declared) {
+    const manifest = environmentManifest(declared);
+    if (manifest) return { root: resolve(declared), source: 'identity-variable', name: manifest.name };
+  }
+  const probes = [];
+  const dshHome = env.DSH_HOME?.trim();
+  if (dshHome) {
+    const root = dirname(resolve(dshHome));
+    probes.push({ root, home: resolve(dshHome), source: 'dsh-home' });
+  }
+  const localAppData = env.LOCALAPPDATA?.trim();
+  if (localAppData) {
+    const root = dirname(resolve(localAppData));
+    probes.push({ root, home: join(root, 'dsh-home'), source: 'isolated-localappdata' });
+  }
+  for (const probe of probes) {
+    if (basename(probe.home).toLowerCase() !== 'dsh-home') continue;
+    const manifest = environmentManifest(probe.root);
+    if (manifest) return { root: probe.root, source: probe.source, name: manifest.name };
+  }
+  return undefined;
+}
+
+/** The `DPXEnvironment` record stored in an environment root, if it is one. */
+function environmentManifest(root) {
+  try {
+    const raw = JSON.parse(readFileSync(join(resolve(root), ENVIRONMENT_MANIFEST_NAME), 'utf8'));
+    return raw?.kind === 'DPXEnvironment' && typeof raw.root === 'string' ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Where DPX keeps `registry.json`.
  *
  * `DPX_HOME` always wins: an operator (or a parent dpx) can point a process at
@@ -76,8 +130,8 @@ export function windowsDiscoveryRegistryPath(platform = process.platform) {
  * `<env-root>\localappdata`; a `dpx` started inside an environment would then
  * report no environments at all, which is the opposite of what a multi
  * environment manager is for. When the process can prove it lives in a managed
- * environment (`DSH_DPX_ENV_ROOT`) and the private default holds no registry,
- * the machine-level discovery pointer is preferred.
+ * environment (see `environmentRootFromProcess`) and the private default holds
+ * no registry, the machine-level discovery pointer is preferred.
  */
 export function defaultRegistryHome(env = process.env, platform = process.platform) {
   if (env.DPX_HOME?.trim()) return resolve(env.DPX_HOME);
@@ -92,7 +146,7 @@ export function defaultRegistryHome(env = process.env, platform = process.platfo
     candidate = resolve(stateHome, 'dsh-dpx');
   }
   if (existsSync(join(candidate, 'registry.json'))) return candidate;
-  if (env[DPX_ENV_ROOT_VARIABLE]?.trim()) {
+  if (environmentRootFromProcess(env, platform)) {
     const pointer = windowsDiscoveryRegistryPath(platform);
     if (pointer && dirname(pointer) !== candidate) return dirname(pointer);
   }
@@ -166,7 +220,7 @@ export function pathsFor(root) {
     xdgData: join(absolute, 'xdg-data'),
     workspace: join(absolute, 'workspace'),
     descriptor: join(absolute, 'dsh-distribution.json'),
-    manifest: join(absolute, '.dpx-environment.json'),
+    manifest: join(absolute, ENVIRONMENT_MANIFEST_NAME),
     desktopDir: join(absolute, DESKTOP_LAUNCHER_DIR),
     desktop: join(absolute, DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME),
   };
@@ -939,14 +993,21 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
       current ? undefined : `dpx env show --${name} 会就地刷新它（标记块之外的内容不动）`);
   }
 
-  const identity = env[DPX_ENV_ROOT_VARIABLE]?.trim();
-  const inside = identity ? pathContains(paths.root, identity) : false;
-  push('process-identity', 'ok',
-    identity
-      ? (inside
-        ? `当前进程就在这个环境里（${DPX_ENV_ROOT_VARIABLE}=${identity}）`
-        : `当前进程在另一个环境里（${DPX_ENV_ROOT_VARIABLE}=${identity}），这是对 --${name} 的只读检查`)
-      : `当前进程不在任何 dpx 环境里（${DPX_ENV_ROOT_VARIABLE} 未设置），这是对 --${name} 的只读检查`);
+  const identity = environmentRootFromProcess(env, process.platform);
+  const declared = env[DPX_ENV_ROOT_VARIABLE]?.trim();
+  let identityDetail;
+  if (!identity) {
+    identityDetail = `当前进程不在任何 dpx 环境里（${DPX_ENV_ROOT_VARIABLE} 未设置，DSH_HOME 与 LOCALAPPDATA 也没有指向带 ${ENVIRONMENT_MANIFEST_NAME} 的环境根），这是对 --${name} 的只读检查`;
+  } else if (pathContains(paths.root, identity.root)) {
+    identityDetail = `当前进程就在这个环境里（依据：${identity.source}）`;
+    if (!declared) {
+      identityDetail += `；${DPX_ENV_ROOT_VARIABLE} 在本进程的环境里不可见——DSH 的 shell/终端层会重建 DSH_* 命名空间并丢掉未声明的键，`
+        + `所以 dpx 改用环境根里的 ${ENVIRONMENT_MANIFEST_NAME} 反推`;
+    }
+  } else {
+    identityDetail = `当前进程在另一个环境里：${identity.root}${identity.name ? `（--${identity.name}）` : ''}（依据：${identity.source}），这是对 --${name} 的只读检查`;
+  }
+  push('process-identity', 'ok', identityDetail);
 
   const registered = (registry?.environments ?? []).some(row => samePath(row.root, paths.root));
   push('registry-membership', registered ? 'ok' : 'error',

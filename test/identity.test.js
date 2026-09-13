@@ -15,6 +15,7 @@ import {
   defaultRegistryHome,
   doctorReport,
   environmentShellScript,
+  environmentRootFromProcess,
   expectedPnpmStore,
   isGlobalInstall,
   launchTargets,
@@ -77,6 +78,59 @@ test('defaultRegistryHome keeps an explicit DPX_HOME and an existing registry', 
   assert.equal(
     defaultRegistryHome({ LOCALAPPDATA: local, [DPX_ENV_ROOT_VARIABLE]: join(home, 'env') }, 'win32'),
     join(local, 'DSH', 'DPX'),
+  );
+});
+
+test('the environment a process lives in is derived from evidence, not one variable', async () => {
+  const { record, paths } = await environment('evidence');
+
+  // 1. The declared identity variable is the direct answer.
+  assert.deepEqual(environmentRootFromProcess({ [DPX_ENV_ROOT_VARIABLE]: paths.root }), {
+    root: paths.root,
+    source: 'identity-variable',
+    name: record.name,
+  });
+
+  // 2. DSH's shell layer rebuilds the DSH_* namespace, so the identity variable
+  //    is gone by the time an agent's command runs. DSH_HOME still points at the
+  //    environment, and the marker file next to it is what dpx trusts.
+  assert.deepEqual(environmentRootFromProcess({ DSH_HOME: paths.dshHome }), {
+    root: paths.root,
+    source: 'dsh-home',
+    name: record.name,
+  });
+
+  // 3. Same conclusion from the isolated LOCALAPPDATA.
+  assert.deepEqual(environmentRootFromProcess({ LOCALAPPDATA: paths.localAppData }), {
+    root: paths.root,
+    source: 'isolated-localappdata',
+    name: record.name,
+  });
+
+  // A host shell looks like none of those: `~/.dsh` is not `<root>\dsh-home`,
+  // and a directory that merely has the right name has no dpx manifest.
+  const impostor = await mkdtemp(join(tmpdir(), 'dpx-impostor-'));
+  await mkdir(join(impostor, 'dsh-home'), { recursive: true });
+  assert.equal(environmentRootFromProcess({ DSH_HOME: join(impostor, 'dsh-home') }), undefined);
+  assert.equal(environmentRootFromProcess({ DSH_HOME: join(impostor, 'user', '.dsh'), LOCALAPPDATA: join(impostor, 'la') }), undefined);
+  assert.equal(environmentRootFromProcess({}), undefined);
+  // A stale pointer is not evidence either.
+  assert.equal(environmentRootFromProcess({ [DPX_ENV_ROOT_VARIABLE]: join(impostor, 'gone') }), undefined);
+});
+
+test('the discovery-pointer fallback stays a Windows-only, in-environment behaviour', async () => {
+  const { paths } = await environment('pointer');
+  const host = await mkdtemp(join(tmpdir(), 'dpx-host-home-'));
+  // Outside an environment the platform default is used verbatim ...
+  assert.equal(
+    defaultRegistryHome({ XDG_STATE_HOME: host }, 'linux'),
+    join(host, 'dsh-dpx'),
+  );
+  // ... and inside one, on a platform with no discovery pointer, dpx still does
+  // not invent a registry: the candidate remains the documented default.
+  assert.equal(
+    defaultRegistryHome({ XDG_STATE_HOME: host, DSH_HOME: paths.dshHome, HOME: host }, 'linux'),
+    join(host, 'dsh-dpx'),
   );
 });
 

@@ -295,6 +295,13 @@ PATH=<环境根>\npm-prefix;…
 也无法据此区分“宿主机”和“某个环境”。这两个变量让任何进程——包括 agent 在环境里再启动的 `dpx`——
 都能直接回答“我在哪个环境里”，而不必从路径反推。
 
+> ⚠️ **不要假设这两个变量一定到得了你手里。** DSH 的 shell / 终端层会为它交给 agent 的子进程
+> **重建 `DSH_*` 命名空间**，只保留它自己声明过的键（`DSH_HOME` 等）。实测：在 dpx 环境里跑 agent 的 shell，
+> 能看到 `DSH_HOME`，但 `DSH_DPX_ENV_ROOT` 和 `DSH_AGENTS_HOME` 都已被丢掉。
+> 因此 dpx 判定“我在哪个环境里”靠的是**结构化证据**（见下文 registry 解析顺序），
+> 而 `dpx env doctor` 的 `process-identity` 会同时报出结论与依据（`identity-variable` / `dsh-home` /
+> `isolated-localappdata`）。**判断自己在哪一套，请看这条结论，不要只看某个变量是否为空。**
+
 注意这里**没有** `NPM_CONFIG_PREFIX` / `NPM_CONFIG_CACHE`：dsh-dpx 不再劫持 npm 的默认值（见下文[「npm 在隔离环境里是原生的」](#npm-在隔离环境里是原生的)）。
 
 其中两者职责不同：
@@ -410,7 +417,7 @@ dpx env doctor --test         # 环境自洽性体检（退出码非零 = 有 er
 | --- | --- |
 | `registry-binding` / `layout` | registry 记录、环境根、`DSH_HOME`、`npm-prefix` 是否互相对得上；受控布局是否齐全 |
 | `environment-guide` | `dsh-home\AGENTS.md` 是否存在且为当前格式（旧格式只提示，不报错） |
-| `process-identity` | 当前进程属于哪个环境（读 `DSH_DPX_ENV_ROOT`），而不是猜 |
+| `process-identity` | 当前进程属于哪个环境，**以及依据**（`identity-variable` / `dsh-home` / `isolated-localappdata`）；身份变量被中间层丢掉时会明说，而不是据此断言“你不在环境里” |
 | `registry-membership` | 当前 DPX registry 里是否登记了这个环境 |
 | `path-shadowing:<target>` | `PATH` 上是否同名副本会抢在环境之前（宿主机泄漏） |
 | `target-copies:<target>` | 全局副本与各 profile 副本的版本是否一致（不一致 = 今天 `launcher ↔ profile` 报错的根因） |
@@ -480,10 +487,21 @@ dpx plugin add --test <包名> --profile dsh-tui --store-dir "C:\existing\store\
 
 1. `DPX_HOME`（显式设置，永远优先；`dpx run` / `dpx exec` / `dpx env use` 都会把它传给子进程）；
 2. 平台默认位置，若该处**已存在** `registry.json`；
-3. 若当前进程能证明自己在某个 dpx 环境里（`DSH_DPX_ENV_ROOT` 已设置）而第 2 步没有命中，
-   则回落到本机的 DPX 发现指针 `HKCU\Software\DSH\DPX\RegistryPath` 所指向的那个 registry。
+3. 若当前进程能**证明**自己在某个 dpx 环境里而第 2 步没有命中，则回落到本机的 DPX 发现指针
+   `HKCU\Software\DSH\DPX\RegistryPath` 所指向的那个 registry。
 
-`dpx env doctor` 会报出当前使用的 registry home，以及这个环境是否登记在其中。
+第 3 步的“证明”不依赖单个环境变量，因为它可能被中间层丢掉（见上文警告）。判定顺序是：
+
+| 依据 | 判据 |
+| --- | --- |
+| `DSH_DPX_ENV_ROOT` | 该目录下存在声明 `kind: DPXEnvironment` 的 `.dpx-environment.json` |
+| `DSH_HOME` | 其父目录同样带这份清单（即 `DSH_HOME` 是 `<环境根>\dsh-home`） |
+| 隔离的 `LOCALAPPDATA` | 其父目录同样带这份清单（即 `<环境根>\localappdata`） |
+
+宿主机三者都不成立：`~/.dsh` 不是 `<环境根>\dsh-home`，单纯同名的目录没有清单，
+失效的指针也不算证据——所以这套反推不会把宿主 shell 误判成环境。
+
+`dpx env doctor` 会报出当前使用的 registry home、`process-identity` 的结论与依据，以及这个环境是否登记在其中。
 
 三条命令即可确认当前的实际落点：
 

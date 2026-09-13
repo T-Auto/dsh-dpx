@@ -31,6 +31,14 @@ export const GUIDE_FILE_NAME = 'AGENTS.md';
 export const GUIDE_BEGIN_PREFIX = '<!-- dpx:environment-guide:begin';
 export const GUIDE_END = '<!-- dpx:environment-guide:end -->';
 export const GUIDE_FORMAT = 2;
+/**
+ * The environment's own identity record, written into the environment root.
+ *
+ * It is named here (rather than only in `index.js`) because the generated guide
+ * has to tell an agent which piece of evidence dpx uses when the identity
+ * variables have been stripped from its shell by a terminal layer.
+ */
+export const ENVIRONMENT_MANIFEST_NAME = '.dpx-environment.json';
 
 export function environmentGuidePath(paths) {
   return join(paths.dshHome, GUIDE_FILE_NAME);
@@ -78,8 +86,15 @@ export function renderEnvironmentGuide(paths, { name, version } = {}) {
   3. \`dpx env use --${name_} --format powershell | Invoke-Expression\` —— 把**当前 shell** 切进环境
   4. 绝对路径：\`${prefix}\\<命令>.cmd\`
 
-- \`DSH_DPX_ENV_ROOT\` 就是给这个问题准备的：任何进程（包括你在环境里再启动的 \`dpx\`）都能据此回答
-  “我在哪个环境里”，不需要靠路径猜。它为空，就说明当前进程不在任何 dpx 环境里。
+- **你的进程在哪个环境里**：\`DSH_DPX_ENV\` / \`DSH_DPX_ENV_ROOT\` 由每条启动路径（\`dpx run\`、\`dpx exec\`、
+  \`dpx env use\`、桌面启动器）设置，任何进程（包括你在环境里再启动的 \`dpx\`）都能据此回答
+  “我在哪个环境里”，不需要靠路径猜。
+- ⚠️ 但**不要假设这两个变量一定在你手里**：DSH 的 shell / 终端层会为它交给 agent 的子进程
+  **重建 \`DSH_*\` 命名空间**，只保留它自己声明过的键（\`DSH_HOME\` 等）。实测：在 dpx 环境里跑 agent 的 shell，
+  能看到 \`DSH_HOME\`，但 \`DSH_DPX_ENV_ROOT\` 和 \`DSH_AGENTS_HOME\` 都已被丢掉。
+  因此 dpx 判断“我在哪个环境里”时还会用结构化证据反推：\`DSH_HOME\`（或隔离的 \`LOCALAPPDATA\`）旁边
+  是否存在声明 \`kind: DPXEnvironment\` 的 \`${ENVIRONMENT_MANIFEST_NAME}\`。你只要记住结论：
+  **要确认自己在哪一套，跑 \`dpx env doctor --${name_}\` 的 \`process-identity\` 结论，不要只看某个变量是否为空。**
 
 ## 1. 这个隔离环境是怎么设计的
 
@@ -166,9 +181,11 @@ dsh-dpx 不劫持 npm：\`dpx run\`、\`dpx exec\` 与桌面启动器都不设�
 - **症状**：启动器报 \`launcher ↔ profile\` 版本不一致。
   **原因**：全局副本与 profile 副本分属两次安装。
   **处置**：\`dpx plugin add\` 与 \`dpx npm install -g\` 分别对齐两侧（\`dpx env doctor\` 会同时给出两侧版本）。
-- **症状**：在环境里 \`dpx env list\` 看不到别的环境。
-  **原因**：环境的 \`LOCALAPPDATA\` 是隔离的，dpx 的默认 registry 位置随之被收容。
-  **处置**：dpx 在检测到 \`DSH_DPX_ENV_ROOT\` 时会回落到本机的 DPX 发现指针；仍不对时显式设置 \`DPX_HOME\`。
+- **症状**：在环境里 \`dpx env list\` 看不到别的环境（只看到一个空的私有 registry）。
+  **原因**：环境的 \`LOCALAPPDATA\` 是隔离的，dpx 的默认 registry 位置随之被收容；
+  判定“我在环境里”所依赖的身份变量又可能被启动链上的终端层丢掉（见上一节）。
+  **处置**：dpx 会用 \`DSH_HOME\` / 隔离的 \`LOCALAPPDATA\` 旁的 \`${ENVIRONMENT_MANIFEST_NAME}\` 反推环境根，
+  并据此回落到本机的 DPX 发现指针（\`HKCU\\Software\\DSH\\DPX\`）；仍不对时显式设置 \`DPX_HOME\`。
 
 ## 边界
 
