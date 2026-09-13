@@ -1,21 +1,34 @@
 #!/usr/bin/env node
 import {
+  SHELL_FORMATS,
   commandUsage,
   createEnvironment,
   defaultRegistryHome,
   displayEnvironment,
+  doctorReport,
+  environmentShellScript,
+  expectedPnpmStore,
   isGlobalInstall,
   launchSpec,
+  launchTarget,
+  launchTargets,
+  listProfiles,
   loadRegistry,
   npmCliPath,
   npmEnvironment,
   npmInstallArguments,
   parseEnvironmentArguments,
-  removeEnvironment,
   pathsFor,
+  pluginArguments,
+  profileDirectory,
+  profileInstalledPackages,
+  readProfileInstaller,
+  removeEnvironment,
+  resolveCommandInPath,
   resolveEnvironment,
   runChild,
   runtimeEnvironment,
+  whichReport,
 } from '../src/index.js';
 import {
   DEFAULT_DESKTOP_SOURCE,
@@ -24,6 +37,7 @@ import {
   parseDesktopSource,
   updateDesktopLauncher,
 } from '../src/desktop-release.js';
+import { resolve } from 'node:path';
 
 async function main(argv = process.argv.slice(2), environment = process.env) {
   const [command, ...rest] = argv;
@@ -34,7 +48,10 @@ async function main(argv = process.argv.slice(2), environment = process.env) {
   const home = defaultRegistryHome(environment);
   if (command === 'npm') return npmCommand(rest, home, environment);
   if (command === 'run') return runCommand(rest, home, environment);
-  if (command === 'env') return environmentCommand(rest, home);
+  if (command === 'exec') return execCommand(rest, home, environment);
+  if (command === 'which') return whichCommand(rest, home, environment);
+  if (command === 'plugin') return pluginCommand(rest, home, environment);
+  if (command === 'env') return environmentCommand(rest, home, environment);
   if (command === 'desktop') return desktopCommand(rest, home, environment);
   if (command === 'descriptor') return descriptorCommand(rest, home);
   throw new Error(`Unknown dpx command ${JSON.stringify(command)}.\n\n${commandUsage()}`);
@@ -61,6 +78,13 @@ async function npmCommand(args, home, environment) {
   return result.code;
 }
 
+/**
+ * Start a launch target *inside* one environment.
+ *
+ * The entry is executed directly, so neither PATH nor an npm shim can decide
+ * which copy runs — that decision belongs to `--<name>`, not to the ambient
+ * shell.
+ */
 async function runCommand(args, home, environment) {
   // --no-desktop only changes first-time environment creation. Preserve it when
   // running DSH so a future DSH flag with that spelling is not swallowed.
@@ -71,8 +95,132 @@ async function runCommand(args, home, environment) {
   const spec = launchSpec(paths, target);
   const result = await runChild(spec.file, [...spec.args, ...targetArgs], {
     cwd: paths.workspace,
-    env: runtimeEnvironment(paths, environment),
+    env: runtimeEnvironment(paths, environment, { name: record.name, registryHome: home }),
   });
+  return result.code;
+}
+
+/**
+ * Run any command inside one environment.
+ *
+ * `dpx run` covers the launch targets dpx knows; this covers everything else —
+ * npm, pnpm, node, git, another dpx — with exactly the environment a `dpx run`
+ * child gets. It is the scriptable form of `dpx env use`, and it is what makes
+ * "develop environment A from inside environment B" a single command.
+ */
+async function execCommand(args, home, environment) {
+  const separator = args.indexOf('--');
+  const selectors = separator >= 0 ? args.slice(0, separator) : args;
+  const { options, rest } = parseExecOptions(selectors);
+  const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
+  const commandArgs = separator >= 0 ? args.slice(separator + 1) : parsed.passthrough;
+  if (commandArgs.length === 0) {
+    throw new Error('Use `dpx exec --<name> [--cwd <dir>] -- <command> [args...]`.');
+  }
+  const record = await resolveEnvironment(parsed.name, home);
+  const paths = pathsFor(record.root);
+  const env = runtimeEnvironment(paths, environment, { name: record.name, registryHome: home });
+  const cwd = options.cwd ? resolve(options.cwd) : paths.workspace;
+  const [verb, ...verbArgs] = commandArgs;
+  const file = resolveCommandInPath(verb, env);
+  // A Windows .cmd/.bat shim is not executable on its own; cmd.exe has to run it.
+  const shell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(file);
+  const result = await runChild(file, verbArgs, { cwd, env, shell });
+  return result.code;
+}
+
+/**
+ * Answer "which copy would actually run?" without running anything.
+ *
+ * This is the command that was missing when a bare `dsh-tui` silently resolved
+ * to the host copy: the answer is computable offline, it just was not exposed.
+ */
+async function whichCommand(args, home, environment) {
+  const parsed = parseEnvironmentArguments(args, { parseDesktop: false });
+  const [target, ...extra] = parsed.passthrough;
+  if (extra.length) throw new Error('dpx which accepts at most one launch target.');
+  if (target && !launchTarget(target)) {
+    throw new Error(`Unsupported launch target ${JSON.stringify(target)}. Supported targets: ${launchTargets().join(', ')}.`);
+  }
+  const record = await resolveEnvironment(parsed.name, home);
+  const paths = pathsFor(record.root);
+  const registry = await loadRegistry(home);
+  const targets = target ? [target] : launchTargets();
+  const reports = targets.map(name_ => whichReport({ paths, name: record.name, target: name_, env: environment, registry }));
+  console.log(JSON.stringify(
+    reports.length === 1
+      ? reports[0]
+      : { environment: record.name, envRoot: paths.root, registry: home, targets: reports },
+    null,
+    2,
+  ));
+  return 0;
+}
+
+const PLUGIN_VERBS = new Set(['add']);
+
+/**
+ * Install into a profile through `dsh plugin`, with the profile's own pnpm
+ * store pinned.
+ *
+ * dsh forwards `plugin add` to pnpm and then reconciles the profile's bundle
+ * list, so dpx must not bypass it — but the forwarder cannot know which store
+ * the profile's existing `node_modules` came from. dpx knows, so it passes it.
+ */
+async function pluginCommand(args, home, environment) {
+  const [verb, ...rest] = args;
+  if (!PLUGIN_VERBS.has(verb)) {
+    throw new Error('Use `dpx plugin add --<name> <package[@version|tarball]> [--profile <profile>] [--store-dir <path>] [--dry-run]`.');
+  }
+  const { options, rest: selectors } = parsePluginOptions(rest);
+  const parsed = parseEnvironmentArguments(selectors, { parseDesktop: false });
+  if (parsed.passthrough.length === 0) {
+    throw new Error('dpx plugin add needs at least one package spec, for example: dpx plugin add --<name> <package> --profile dsh-tui');
+  }
+  const record = await resolveEnvironment(parsed.name, home);
+  const paths = pathsFor(record.root);
+  const profiles = listProfiles(paths);
+  const profile = options.profile
+    ?? (profiles.includes('web') ? 'web' : profiles.length === 1 ? profiles[0] : undefined);
+  if (!profile) {
+    throw new Error(`Specify the target profile with --profile. Available profiles: ${profiles.join(', ') || '(none yet)'}.`);
+  }
+  const directory = profileDirectory(paths, profile);
+  const installer = readProfileInstaller(directory);
+  const storeDir = options.storeDir ?? installer?.storeDir ?? expectedPnpmStore(paths);
+  const dshArgs = ['plugin', '--profile', profile, ...pluginArguments({ args: ['add', ...parsed.passthrough], storeDir })];
+  const spec = launchSpec(paths, 'dsh');
+  const payload = {
+    environment: record.name,
+    profile,
+    profileDir: directory,
+    store: {
+      path: storeDir,
+      source: options.storeDir ? 'flag' : installer?.storeDir ? 'existing-node_modules' : 'environment-default',
+      installer: installer?.manager,
+      expected: expectedPnpmStore(paths),
+    },
+    command: [spec.file, ...spec.args, ...dshArgs].join(' '),
+  };
+  if (options.dryRun) {
+    console.log(JSON.stringify({ ...payload, dryRun: true, exitCode: null, installed: [] }, null, 2));
+    return 0;
+  }
+  const result = await runChild(spec.file, [...spec.args, ...dshArgs], {
+    cwd: paths.workspace,
+    env: runtimeEnvironment(paths, environment, { name: record.name, registryHome: home }),
+  });
+  const installed = profileInstalledPackages(paths, profile);
+  console.log(JSON.stringify({
+    ...payload,
+    dryRun: false,
+    exitCode: result.code,
+    installed,
+    guidance: result.code === 0
+      ? undefined
+      : `安装失败。先跑 dpx env doctor --${record.name} 看 profile 的 store 与两侧版本；`
+        + `若报 store 不一致，用 dpx plugin add --${record.name} <包名> --profile ${profile} --store-dir "${installer?.storeDir ?? storeDir}" 保持既有链接。`,
+  }, null, 2));
   return result.code;
 }
 
@@ -101,6 +249,69 @@ function parseDesktopOptions(args) {
     if (arg === '--prerelease') { options.prerelease = true; continue; }
     if (arg === '--force') { options.force = true; continue; }
     if (arg === '--dry-run') { options.dryRun = true; continue; }
+    rest.push(arg);
+  }
+  return { options, rest };
+}
+
+function parsePluginOptions(args) {
+  const options = { profile: undefined, storeDir: undefined, dryRun: false };
+  const rest = [];
+  let index = 0;
+  const readValue = (name, inline) => {
+    if (inline !== undefined) return inline;
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith('--')) throw new Error(`${name} 需要一个值。`);
+    index += 1;
+    return value;
+  };
+  for (; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--profile' || arg.startsWith('--profile=')) { options.profile = readValue('--profile', arg.startsWith('--profile=') ? arg.slice(10) : undefined); continue; }
+    if (arg === '--store-dir' || arg.startsWith('--store-dir=')) { options.storeDir = readValue('--store-dir', arg.startsWith('--store-dir=') ? arg.slice(12) : undefined); continue; }
+    if (arg === '--dry-run') { options.dryRun = true; continue; }
+    rest.push(arg);
+  }
+  return { options, rest };
+}
+
+function parseExecOptions(args) {
+  const options = { cwd: undefined };
+  const rest = [];
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--cwd' || arg.startsWith('--cwd=')) {
+      const inline = arg.startsWith('--cwd=') ? arg.slice(6) : undefined;
+      if (inline !== undefined) { options.cwd = inline; continue; }
+      const value = args[index + 1];
+      if (value === undefined) throw new Error('--cwd 需要一个值。');
+      options.cwd = value;
+      index += 1;
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { options, rest };
+}
+
+function parseUseOptions(args) {
+  const options = { format: 'powershell' };
+  const rest = [];
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--format' || arg.startsWith('--format=')) {
+      const inline = arg.startsWith('--format=') ? arg.slice(9) : undefined;
+      const value = inline ?? args[index + 1];
+      if (value === undefined) throw new Error('--format 需要一个值。');
+      if (inline === undefined) index += 1;
+      if (!SHELL_FORMATS.includes(value)) {
+        throw new Error(`Unsupported shell format ${JSON.stringify(value)}. Supported formats: ${SHELL_FORMATS.join(', ')}.`);
+      }
+      options.format = value;
+      continue;
+    }
     rest.push(arg);
   }
   return { options, rest };
@@ -161,7 +372,7 @@ async function desktopCommand(args, home, environment) {
   return 0;
 }
 
-async function environmentCommand(args, home) {
+async function environmentCommand(args, home, environment) {
   const [verb, ...rest] = args;
   if (verb === 'list') {
     const registry = await loadRegistry(home);
@@ -174,6 +385,35 @@ async function environmentCommand(args, home) {
     console.log(JSON.stringify(displayEnvironment(await resolveEnvironment(parsed.name, home)), null, 2));
     return 0;
   }
+  if (verb === 'doctor') {
+    const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
+    if (parsed.passthrough.length) throw new Error('env doctor accepts only an environment selector.');
+    const record = await resolveEnvironment(parsed.name, home);
+    const registry = await loadRegistry(home);
+    const report = doctorReport({
+      paths: pathsFor(record.root),
+      name: record.name,
+      record,
+      env: environment,
+      registry,
+      registryHome: home,
+    });
+    console.log(JSON.stringify(report, null, 2));
+    return report.ok ? 0 : 1;
+  }
+  if (verb === 'use') {
+    const { options, rest: selectors } = parseUseOptions(rest);
+    const parsed = parseEnvironmentArguments(selectors, { parseDesktop: false });
+    if (parsed.passthrough.length) throw new Error('env use accepts only an environment selector and --format.');
+    const record = await resolveEnvironment(parsed.name, home);
+    process.stdout.write(environmentShellScript(pathsFor(record.root), {
+      name: record.name,
+      format: options.format,
+      env: environment,
+      registryHome: home,
+    }));
+    return 0;
+  }
   if (verb === 'remove') {
     const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
     const purge = parsed.passthrough.includes('--purge');
@@ -183,7 +423,7 @@ async function environmentCommand(args, home) {
     console.log(JSON.stringify({ removed: removed.record.name, root: removed.record.root, purged: removed.purged }, null, 2));
     return 0;
   }
-  throw new Error('Use `dpx env list`, `dpx env show --name`, or `dpx env remove --name [--purge]`.');
+  throw new Error('Use `dpx env list`, `dpx env show --name`, `dpx env doctor --name`, `dpx env use --name [--format powershell|cmd|json]`, or `dpx env remove --name [--purge]`.');
 }
 
 async function descriptorCommand(args, home) {

@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, installBundledDesktopLauncher } from './desktop-release.js';
-import { ensureEnvironmentGuide } from './environment-guide.js';
+import { GUIDE_FORMAT, ensureEnvironmentGuide, environmentGuidePath } from './environment-guide.js';
 
 export const FORMAT = 1;
 export const DPX_API_VERSION = 'dpx.dsh.dev/v1alpha1';
@@ -14,6 +14,23 @@ export const DISTRIBUTION = Object.freeze({
   id: 'urn:dsh:distribution:t-auto:dsh-dpx',
   version: '0.1.0',
 });
+
+/**
+ * Environment identity handed to every child dpx launches.
+ *
+ * `DSH_HOME` already tells DSH which state it uses, but it is DSH's own
+ * variable: it says nothing about *which managed environment* a process lives
+ * in, and nothing outside DSH reads it. These two variables make the
+ * environment discoverable by any tool — including a `dpx` that an agent
+ * starts *inside* the environment, whose default registry location is otherwise
+ * swallowed by the isolated `LOCALAPPDATA`.
+ */
+export const DPX_ENV_VARIABLE = 'DSH_DPX_ENV';
+export const DPX_ENV_ROOT_VARIABLE = 'DSH_DPX_ENV_ROOT';
+/** DPX's own registry location; propagated so nested dpx calls share one registry. */
+export const DPX_HOME_VARIABLE = 'DPX_HOME';
+export const WINDOWS_DISCOVERY_KEY = 'HKCU\\Software\\DSH\\DPX';
+
 const ENVIRONMENT_NAME = /^[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 // These belong to the selected DSH/TUI target, not to DPX. A future
@@ -24,16 +41,62 @@ const TARGET_OPTIONS = new Set([
 ]);
 const NO_DESKTOP_OPTION = '--no-desktop';
 
+/**
+ * Read the machine-level DPX discovery pointer (`HKCU\Software\DSH\DPX`).
+ *
+ * dpx publishes this key next to its registry (see `publishWindowsRegistry`),
+ * so a tool that cannot see the manager's state directory can still find the
+ * one registry that owns every environment on this machine. It is read-only
+ * here, and only ever used as a documented fallback.
+ */
+export function windowsDiscoveryRegistryPath(platform = process.platform) {
+  if (platform !== 'win32') return undefined;
+  try {
+    const result = spawnSync('reg.exe', ['query', WINDOWS_DISCOVERY_KEY, '/v', 'RegistryPath'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return undefined;
+    const match = /RegistryPath\s+REG_SZ\s+(.+?)\s*$/m.exec(result.stdout);
+    const value = match?.[1]?.trim();
+    return value && isAbsolute(value) ? resolve(value) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Where DPX keeps `registry.json`.
+ *
+ * `DPX_HOME` always wins: an operator (or a parent dpx) can point a process at
+ * one exact registry. Otherwise the platform default is used — with one
+ * documented exception. A dpx environment isolates `LOCALAPPDATA`, so the
+ * child's "platform default" is a *private, empty* registry inside
+ * `<env-root>\localappdata`; a `dpx` started inside an environment would then
+ * report no environments at all, which is the opposite of what a multi
+ * environment manager is for. When the process can prove it lives in a managed
+ * environment (`DSH_DPX_ENV_ROOT`) and the private default holds no registry,
+ * the machine-level discovery pointer is preferred.
+ */
 export function defaultRegistryHome(env = process.env, platform = process.platform) {
   if (env.DPX_HOME?.trim()) return resolve(env.DPX_HOME);
+  let candidate;
   if (platform === 'win32') {
     const localAppData = env.LOCALAPPDATA?.trim();
     if (!localAppData) throw new Error('LOCALAPPDATA is unavailable; set DPX_HOME to an absolute private directory.');
-    return resolve(localAppData, 'DSH', 'DPX');
+    candidate = resolve(localAppData, 'DSH', 'DPX');
+  } else {
+    const stateHome = env.XDG_STATE_HOME?.trim() || (env.HOME ? join(env.HOME, '.local', 'state') : undefined);
+    if (!stateHome) throw new Error('Cannot determine a state directory; set DPX_HOME.');
+    candidate = resolve(stateHome, 'dsh-dpx');
   }
-  const stateHome = env.XDG_STATE_HOME?.trim() || (env.HOME ? join(env.HOME, '.local', 'state') : undefined);
-  if (!stateHome) throw new Error('Cannot determine a state directory; set DPX_HOME.');
-  return resolve(stateHome, 'dsh-dpx');
+  if (existsSync(join(candidate, 'registry.json'))) return candidate;
+  if (env[DPX_ENV_ROOT_VARIABLE]?.trim()) {
+    const pointer = windowsDiscoveryRegistryPath(platform);
+    if (pointer && dirname(pointer) !== candidate) return dirname(pointer);
+  }
+  return candidate;
 }
 
 export function registryPath(home = defaultRegistryHome()) {
@@ -395,12 +458,25 @@ export function npmEnvironment(inherited = process.env) {
  * the generated `dsh-home/AGENTS.md` tells an agent to use an explicit
  * `--prefix` / `--cache` (or `dpx npm install`) when it really means this
  * environment.
+ *
+ * What is deliberately *present*: the environment's own identity. `DSH_HOME`
+ * only tells DSH where its state is; nothing outside DSH reads it, and a tool
+ * cannot tell "inside environment A" from "the host" by looking at it alone.
+ * `DSH_DPX_ENV` / `DSH_DPX_ENV_ROOT` are the environment's name and root, so
+ * any process — including another `dpx` started inside this one — can answer
+ * "which environment am I in?" without guessing from paths. `DPX_HOME` is
+ * propagated for the same reason: every environment on this machine is owned by
+ * one registry, and a nested dpx must find that registry, not a private empty
+ * one produced by the isolated `LOCALAPPDATA`.
  */
-export function runtimeEnvironment(paths, inherited = process.env) {
+export function runtimeEnvironment(paths, inherited = process.env, { name, registryHome } = {}) {
   const env = npmEnvironment(inherited);
   env.DSH_HOME = paths.dshHome;
   env.DSH_AGENTS_HOME = paths.agentsHome;
   env.DSH_TELEMETRY_DISABLED = '1';
+  env[DPX_ENV_ROOT_VARIABLE] = paths.root;
+  env[DPX_ENV_VARIABLE] = name ?? basename(paths.root);
+  if (registryHome) env[DPX_HOME_VARIABLE] = registryHome;
   env.HOME = paths.home;
   env.USERPROFILE = paths.home;
   env.APPDATA = paths.appData;
@@ -412,6 +488,27 @@ export function runtimeEnvironment(paths, inherited = process.env) {
   env.XDG_DATA_HOME = paths.xdgData;
   env.PATH = [paths.npmPrefix, inherited.PATH].filter(Boolean).join(process.platform === 'win32' ? ';' : ':');
   return env;
+}
+
+/**
+ * The launch targets dpx recognizes.
+ *
+ * This is dpx's own compatibility list, not a protocol: a target names the npm
+ * package plus the entry file dpx starts *directly*, so a launch never depends
+ * on PATH lookup, on a `.cmd` shim, or on any shell. `dpx which` reports the
+ * same list, which is why it is exported rather than inlined.
+ */
+export const LAUNCH_TARGETS = Object.freeze([
+  Object.freeze({ target: 'dsh', package: '@deepseek-ai/dsh', entry: ['lib', 'bin.js'] }),
+  Object.freeze({ target: 'dsh-tui', package: '@deepseek-harness-tui/dsh-tui', entry: ['bin', 'dsh-tui.js'] }),
+]);
+
+export function launchTarget(name) {
+  return LAUNCH_TARGETS.find(entry => entry.target === name);
+}
+
+export function launchTargets() {
+  return LAUNCH_TARGETS.map(entry => entry.target);
 }
 
 function globalPackageRoots(paths) {
@@ -428,18 +525,26 @@ export function locatePackage(paths, packageName) {
   return undefined;
 }
 
+/** Read the version a package manifest declares, without failing on damage. */
+export function packageVersionAt(directory) {
+  try {
+    const raw = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+    return typeof raw?.version === 'string' ? raw.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function launchSpec(paths, target) {
-  if (target === 'dsh') {
-    const pkg = locatePackage(paths, '@deepseek-ai/dsh');
-    if (!pkg) throw new Error('The isolated @deepseek-ai/dsh package is missing. Install it with dpx npm install -g @deepseek-ai/dsh --<environment>.');
-    return { file: process.execPath, args: [join(pkg, 'lib', 'bin.js')] };
+  const entry = launchTarget(target);
+  if (!entry) {
+    throw new Error(`Unsupported launch target ${JSON.stringify(target)}. Supported targets: ${launchTargets().join(', ')}.`);
   }
-  if (target === 'dsh-tui') {
-    const pkg = locatePackage(paths, '@deepseek-harness-tui/dsh-tui');
-    if (!pkg) throw new Error('The isolated dsh-tui package is missing. Install it with dpx npm install -g @deepseek-harness-tui/dsh-tui --<environment>.');
-    return { file: process.execPath, args: [join(pkg, 'bin', 'dsh-tui.js')] };
+  const pkg = locatePackage(paths, entry.package);
+  if (!pkg) {
+    throw new Error(`The isolated ${entry.package} package is missing. Install it with dpx npm install -g ${entry.package} --<environment>.`);
   }
-  throw new Error(`Unsupported launch target ${JSON.stringify(target)}. Supported targets: dsh, dsh-tui.`);
+  return { file: process.execPath, args: [join(pkg, ...entry.entry)] };
 }
 
 export function runChild(file, args, options) {
@@ -545,10 +650,498 @@ export function npmInstallArguments(args, prefix, cache) {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Runtime identity: "which copy would actually run?"
+//
+// dpx knows the npm-prefix ↔ DSH_HOME ↔ profile relation, but that knowledge
+// used to live only inside a `dpx` process. Everything below turns it into a
+// queryable fact, so neither a human nor an agent has to guess which DSH a
+// bare command name resolves to.
+// ---------------------------------------------------------------------------
+
+/** Compare two paths the way the platform's filesystem does. */
+export function samePath(left, right, platform = process.platform) {
+  const a = resolve(left);
+  const b = resolve(right);
+  return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** Is `candidate` inside `parent` (or equal to it)? */
+export function pathContains(parent, candidate, platform = process.platform) {
+  const a = resolve(parent);
+  const b = resolve(candidate);
+  const relative = platform === 'win32'
+    ? (b.toLowerCase().startsWith(a.toLowerCase()) ? b.slice(a.length) : undefined)
+    : (b.startsWith(a) ? b.slice(a.length) : undefined);
+  if (relative === undefined) return false;
+  return relative === '' || relative.startsWith('\\') || relative.startsWith('/');
+}
+
+export function pathEntries(env = process.env, platform = process.platform) {
+  const raw = env.PATH ?? env.Path ?? '';
+  return String(raw).split(platform === 'win32' ? ';' : ':').map(entry => entry.trim()).filter(Boolean);
+}
+
+const WINDOWS_SHIM_SUFFIXES = ['.cmd', '.exe', '.bat', '.ps1'];
+
+/**
+ * Every file a shell would consider when asked for `target`, in PATH order.
+ *
+ * This is intentionally a *prediction*, not an execution: it never runs the
+ * candidate, so reporting on an environment can never have side effects. The
+ * first entry is what a bare `target` resolves to in this process's ambient
+ * PATH — which is exactly the question that produced the original confusion.
+ */
+export function commandCandidates(target, { env = process.env, platform = process.platform } = {}) {
+  const suffixes = platform === 'win32' ? WINDOWS_SHIM_SUFFIXES : [''];
+  const found = [];
+  const seen = new Set();
+  for (const directory of pathEntries(env, platform)) {
+    for (const suffix of suffixes) {
+      const file = resolve(directory, `${target}${suffix}`);
+      const key = platform === 'win32' ? file.toLowerCase() : file;
+      if (seen.has(key)) continue;
+      let stats;
+      try {
+        stats = statSync(file);
+      } catch {
+        continue;
+      }
+      if (!stats.isFile()) continue;
+      seen.add(key);
+      found.push({ file, directory: resolve(directory) });
+      break;
+    }
+  }
+  return found;
+}
+
+/** Resolve a command name through an environment's own PATH (used by `dpx exec`). */
+export function resolveCommandInPath(command, env = process.env, platform = process.platform) {
+  if (isAbsolute(command) || command.includes('/') || command.includes('\\')) return command;
+  return commandCandidates(command, { env, platform })[0]?.file ?? command;
+}
+
+/**
+ * Which managed environment (if any) owns a path, and which `DSH_HOME` a copy
+ * found there would use.
+ *
+ * A copy found outside every registered environment belongs to the host, and
+ * the interesting fact about it is that it will *silently use the host's own
+ * DSH state*: that is why "I installed it but the UI did not change" happens.
+ */
+export function classifyCommandPath(file, { paths, name, registry, env = process.env, platform = process.platform } = {}) {
+  const rows = [];
+  if (paths) rows.push({ name, root: paths.root });
+  for (const row of registry?.environments ?? []) {
+    if (!rows.some(candidate => samePath(candidate.root, row.root, platform))) rows.push({ name: row.name, root: row.root });
+  }
+  for (const row of rows) {
+    const prefix = pathsFor(row.root).npmPrefix;
+    if (!pathContains(prefix, file, platform)) continue;
+    return {
+      file,
+      inEnvironment: true,
+      environment: row.name,
+      envRoot: row.root,
+      dshHome: pathsFor(row.root).dshHome,
+      source: 'npm-prefix',
+    };
+  }
+  const hostHome = env.DSH_HOME?.trim()
+    || (env.USERPROFILE?.trim() || env.HOME?.trim()
+      ? join(env.USERPROFILE?.trim() || env.HOME.trim(), '.dsh')
+      : undefined);
+  return { file, inEnvironment: false, environment: undefined, envRoot: undefined, dshHome: hostHome, source: 'host' };
+}
+
+/** Every copy of one launch target inside an environment: global + each profile. */
+export function targetCopies(paths, target) {
+  const entry = launchTarget(target);
+  if (!entry) return { target, package: undefined, copies: [] };
+  const copies = [];
+  const globalPackage = locatePackage(paths, entry.package);
+  if (globalPackage) {
+    copies.push({ location: 'npm-prefix', path: globalPackage, version: packageVersionAt(globalPackage) });
+  }
+  for (const profile of listProfiles(paths)) {
+    const directory = join(paths.dshHome, 'profiles', profile, 'node_modules', ...entry.package.split('/'));
+    if (!existsSync(directory)) continue;
+    copies.push({ location: `profile:${profile}`, path: directory, version: packageVersionAt(directory) });
+  }
+  return { target, package: entry.package, entry: join(...entry.entry), copies };
+}
+
+export function listProfiles(paths) {
+  try {
+    return readdirSync(join(paths.dshHome, 'profiles'), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && entry.name !== 'node_modules' && !entry.name.startsWith('.'))
+      .map(entry => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse pnpm's `node_modules/.modules.yaml`.
+ *
+ * Despite the extension, pnpm writes this file as **JSON** in current versions
+ * and wrote it as YAML in older ones, so both shapes are accepted. Reading it is
+ * how dpx learns which store a profile's `node_modules` is already linked from,
+ * which is the difference between a working `plugin add` and
+ * `ERR_PNPM_UNEXPECTED_STORE`.
+ */
+function parseModulesManifest(text) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const raw = JSON.parse(trimmed);
+      if (raw && typeof raw === 'object') {
+        const stringValue = value => (typeof value === 'string' && value ? value : undefined);
+        return {
+          storeDir: stringValue(raw.storeDir),
+          virtualStoreDir: stringValue(raw.virtualStoreDir),
+          layoutVersion: raw.layoutVersion === undefined ? undefined : String(raw.layoutVersion),
+        };
+      }
+    } catch {
+      // Fall through to the line scan below.
+    }
+  }
+  const pick = key => {
+    const match = new RegExp(`^${key}:[ \\t]*(.+)$`, 'm').exec(text);
+    return match ? match[1].trim().replace(/^['"]|['"]$/g, '') : undefined;
+  };
+  return { storeDir: pick('storeDir'), virtualStoreDir: pick('virtualStoreDir'), layoutVersion: pick('layoutVersion') };
+}
+
+function directoryHasEntries(directory) {
+  try {
+    return readdirSync(directory).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** How a profile's `node_modules` was installed, and from which store. */
+export function readProfileInstaller(profileDir) {
+  const modules = join(profileDir, 'node_modules');
+  const modulesManifest = join(modules, '.modules.yaml');
+  if (existsSync(modulesManifest)) {
+    try {
+      return { manager: 'pnpm', manifest: modulesManifest, ...parseModulesManifest(readFileSync(modulesManifest, 'utf8')) };
+    } catch {
+      return { manager: 'pnpm', manifest: modulesManifest };
+    }
+  }
+  if (existsSync(join(profileDir, 'package-lock.json'))) {
+    return { manager: 'npm', manifest: join(profileDir, 'package-lock.json') };
+  }
+  // An existing but empty `node_modules` is not an install: DSH creates the
+  // directory as part of profile scaffolding, and reporting it would be a false
+  // alarm on every fresh profile.
+  if (existsSync(modules) && directoryHasEntries(modules)) return { manager: 'unknown' };
+  return undefined;
+}
+
+/** The pnpm store dpx expects a child of this environment to use. */
+export function expectedPnpmStore(paths) {
+  return join(paths.xdgData, 'pnpm', 'store');
+}
+
+export function profileDirectory(paths, profile) {
+  return join(paths.dshHome, 'profiles', profile);
+}
+
+/** What `dpx run --<name> <target>` starts, versus what a bare `<target>` starts. */
+export function whichReport({ paths, name, target, env = process.env, registry } = {}) {
+  const entry = launchTarget(target);
+  const isolatedPackage = entry ? locatePackage(paths, entry.package) : undefined;
+  const isolated = entry ? {
+    file: isolatedPackage ? join(isolatedPackage, ...entry.entry) : join(paths.npmPrefix, 'node_modules', ...entry.package.split('/'), ...entry.entry),
+    present: Boolean(isolatedPackage),
+    via: `dpx run --${name} ${target}`,
+    package: entry.package,
+    version: isolatedPackage ? packageVersionAt(isolatedPackage) : undefined,
+  } : undefined;
+  const ambientPath = commandCandidates(target, { env }).map((candidate, index) =>
+    ({ ...classifyCommandPath(candidate.file, { paths, name, registry, env }), winner: index === 0 }));
+  const winner = ambientPath.find(candidate => candidate.winner);
+  const verdict = !isolated?.present ? 'not-installed' : winner && !winner.inEnvironment ? 'host-leak' : 'clean';
+  return {
+    environment: name,
+    envRoot: paths.root,
+    target,
+    isolated,
+    copies: targetCopies(paths, target).copies,
+    ambientPath,
+    verdict,
+    advice: whichAdvice({ verdict, target, name, paths, winner }),
+  };
+}
+
+function whichAdvice({ verdict, target, name, paths, winner }) {
+  if (verdict === 'not-installed') {
+    return `这个环境里没有 ${target}。先安装：dpx npm install -g <包名> --${name}`;
+  }
+  if (verdict === 'host-leak') {
+    const home = winner?.dshHome ? `，并会使用 ${winner.dshHome}` : '';
+    return `裸敲 \`${target}\` 命中的是环境外的副本 ${winner.file}${home}。请用 dpx run --${name} ${target}，`
+      + `或 dpx exec --${name} -- ${target}，或绝对路径 ${join(paths.npmPrefix, `${target}.cmd`)}。`;
+  }
+  return `PATH 上首个 \`${target}\` 位于本环境内；仍建议用 dpx run --${name} ${target} 以保证 DSH_HOME 由 dpx 一起钉住。`;
+}
+
+function check(id, status, detail, fix) {
+  return { id, status, detail, ...(fix ? { fix } : {}) };
+}
+
+/**
+ * One pass over everything that can make an environment look "wrong": the
+ * registry binding, the generated guide, PATH shadowing, the two copies of each
+ * launch target, and the installer/store each profile was linked from.
+ *
+ * Every finding carries a `fix` that is a real command, because the point of
+ * the check is to end a debugging session, not to start one.
+ */
+export function doctorReport({ paths, name, record, env = process.env, registry, registryHome } = {}) {
+  const checks = [];
+  const push = (...args) => { checks.push(check(...args)); };
+
+  const rootExists = existsSync(paths.root);
+  push('registry-binding', rootExists ? 'ok' : 'error',
+    rootExists
+      ? `registry、环境根与 DSH_HOME 对得上：${paths.root}`
+      : `registry 里有 --${name}，但环境根不存在：${paths.root}`,
+    rootExists ? undefined : `dpx env remove --${name} 注销记录，或重建该环境`);
+  if (rootExists) {
+    const expected = [
+      ['npm-prefix', paths.npmPrefix], ['dsh-home', paths.dshHome], ['agents-home', paths.agentsHome],
+      ['workspace', paths.workspace], ['descriptor', paths.descriptor], ['manifest', paths.manifest],
+    ];
+    const missing = expected.filter(([, value]) => !existsSync(value)).map(([label]) => label);
+    push('layout', missing.length === 0 ? 'ok' : 'error',
+      missing.length === 0 ? '受控布局的目录与文件都存在' : `缺少受控布局项：${missing.join('、')}`,
+      missing.length === 0 ? undefined : `复用该环境即可自动补齐：dpx env show --${name}`);
+  }
+
+  const guide = environmentGuidePath(paths);
+  if (!existsSync(guide)) {
+    push('environment-guide', 'error', `环境级指令文件缺失：${guide}`,
+      `dpx env show --${name} 会重新生成它`);
+  } else {
+    const text = readFileSync(guide, 'utf8');
+    const current = text.includes(`dpx:environment-guide:begin v${GUIDE_FORMAT}`);
+    push('environment-guide', current ? 'ok' : 'warn',
+      current ? `环境级指令文件是最新格式（v${GUIDE_FORMAT}）：${guide}`
+        : `环境级指令文件是旧格式，缺少本次新增的排查与通用规则：${guide}`,
+      current ? undefined : `dpx env show --${name} 会就地刷新它（标记块之外的内容不动）`);
+  }
+
+  const identity = env[DPX_ENV_ROOT_VARIABLE]?.trim();
+  const inside = identity ? pathContains(paths.root, identity) : false;
+  push('process-identity', 'ok',
+    identity
+      ? (inside
+        ? `当前进程就在这个环境里（${DPX_ENV_ROOT_VARIABLE}=${identity}）`
+        : `当前进程在另一个环境里（${DPX_ENV_ROOT_VARIABLE}=${identity}），这是对 --${name} 的只读检查`)
+      : `当前进程不在任何 dpx 环境里（${DPX_ENV_ROOT_VARIABLE} 未设置），这是对 --${name} 的只读检查`);
+
+  const registered = (registry?.environments ?? []).some(row => samePath(row.root, paths.root));
+  push('registry-membership', registered ? 'ok' : 'error',
+    registered ? `registry 位于 ${registryHome}，其中登记了 --${name}`
+      : `registry（${registryHome}）里没有指向 ${paths.root} 的记录`,
+    registered ? undefined : `确认 DPX_HOME；在环境内看不到别的环境时用 dpx which --${name} 查看 registry 归属`);
+
+  for (const target of launchTargets()) {
+    const report = whichReport({ paths, name, target, env, registry });
+    if (report.verdict === 'host-leak') {
+      push(`path-shadowing:${target}`, 'error', report.advice, `dpx run --${name} ${target}`);
+    } else if (report.verdict === 'not-installed') {
+      push(`path-shadowing:${target}`, 'warn', `环境内没有安装 ${target}；裸敲它会命中环境外的副本（如果有）`,
+        `dpx npm install -g <包名> --${name}`);
+    } else {
+      push(`path-shadowing:${target}`, 'ok',
+        report.ambientPath[0]
+          ? `PATH 上首个 ${target} 位于本环境内：${report.ambientPath[0].file}`
+          : `PATH 上没有环境外的 ${target} 副本`);
+    }
+    const copies = report.copies;
+    const global = copies.find(copy => copy.location === 'npm-prefix');
+    const profiles = copies.filter(copy => copy.location.startsWith('profile:'));
+    if (global && profiles.length) {
+      const mismatched = profiles.filter(copy => copy.version !== global.version);
+      push(`target-copies:${target}`, mismatched.length ? 'error' : 'ok',
+        mismatched.length
+          ? `${target} 的全局副本是 ${global.version ?? '未知版本'}，而 ${mismatched.map(copy => `${copy.location}=${copy.version ?? '未知版本'}`).join('、')}`
+          : `${target} 的全局副本与 ${profiles.length} 个 profile 副本版本一致（${global.version ?? '未知版本'}）`,
+        mismatched.length ? `dpx plugin add --${name} <包名> --profile <profile> 或 dpx npm install -g <包名>@<版本> --${name} 对齐两侧` : undefined);
+    } else if (profiles.length && !global) {
+      push(`target-copies:${target}`, 'warn',
+        `${target} 只存在于 profile：${profiles.map(copy => `${copy.location}=${copy.version ?? '未知版本'}`).join('、')}`,
+        `dpx npm install -g <包名> --${name} 让 dpx run --${name} ${target} 也能启动`);
+    }
+  }
+
+  const expectedStore = expectedPnpmStore(paths);
+  const profiles = listProfiles(paths);
+  for (const profile of profiles) {
+    const directory = profileDirectory(paths, profile);
+    const installer = readProfileInstaller(directory);
+    if (!installer) continue;
+    if (!installer.storeDir) {
+      push(`profile-store:${profile}`, installer.manager === 'unknown' ? 'warn' : 'ok',
+        installer.manager === 'unknown'
+          ? `profile ${profile} 有 node_modules，但读不出安装器（缺 .modules.yaml / package-lock.json）`
+          : `profile ${profile} 由 ${installer.manager} 安装（未声明 store 目录）`,
+        installer.manager === 'unknown' ? `重建该 profile，或始终用 dpx plugin add --${name} … --profile ${profile} 安装` : undefined);
+      continue;
+    }
+    const insideRoot = pathContains(paths.root, installer.storeDir);
+    const expected = pathContains(expectedStore, installer.storeDir);
+    if (!insideRoot) {
+      push(`profile-store:${profile}`, 'error',
+        `profile ${profile} 的 node_modules 链接自环境外的 store：${installer.storeDir}`
+        + `（任何补充安装都会报 ERR_PNPM_UNEXPECTED_STORE）`,
+        `dpx plugin add --${name} <包名> --profile ${profile} --store-dir "${installer.storeDir}" 保持既有链接，`
+        + `或删除 ${join(directory, 'node_modules')} 后用 dpx plugin add --${name} <包名> --profile ${profile} 重建`);
+    } else if (!expected) {
+      push(`profile-store:${profile}`, 'warn',
+        `profile ${profile} 的 store 在环境内但不是 dpx 期望的那个：${installer.storeDir}（期望 ${expectedStore}）`,
+        `dpx plugin add --${name} <包名> --profile ${profile} --store-dir "${installer.storeDir}"`);
+    } else {
+      push(`profile-store:${profile}`, 'ok', `profile ${profile} 由 ${installer.manager} 安装，store 位于环境内：${installer.storeDir}`);
+    }
+  }
+
+  const errors = checks.filter(row => row.status === 'error').length;
+  const warnings = checks.filter(row => row.status === 'warn').length;
+  return {
+    environment: name,
+    envRoot: paths.root,
+    registry: registryHome,
+    ok: errors === 0,
+    summary: { errors, warnings, checks: checks.length },
+    checks,
+    ...(record?.instance ? { instanceId: record.instance.instanceId } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// `dpx env use`: the environment as a script a shell can evaluate
+// ---------------------------------------------------------------------------
+
+const SHELL_EXPORT_KEYS = [
+  DPX_ENV_VARIABLE, DPX_ENV_ROOT_VARIABLE, DPX_HOME_VARIABLE,
+  'DSH_HOME', 'DSH_AGENTS_HOME', 'DSH_TELEMETRY_DISABLED',
+  'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+  'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+];
+const SHELL_UNSET_KEYS = ['NODE_OPTIONS', 'NODE_PATH', 'NPM_CONFIG_PREFIX', 'NPM_CONFIG_CACHE'];
+
+export const SHELL_FORMATS = ['powershell', 'cmd', 'json'];
+
+/**
+ * A script that puts the *current* shell inside one environment.
+ *
+ * dpx cannot change its parent's environment, so it prints the assignments
+ * instead; the caller decides whether to evaluate them. The script prepends the
+ * environment's npm prefix to the PATH that exists at evaluation time, which
+ * keeps the "prepend, never replace" contract that `runtimeEnvironment` uses.
+ */
+export function environmentShellScript(paths, { name, format = 'powershell', env = process.env, registryHome } = {}) {
+  const target = runtimeEnvironment(paths, env, { name, registryHome });
+  const assignments = SHELL_EXPORT_KEYS
+    .filter(key => typeof target[key] === 'string' && target[key].length > 0)
+    .map(key => [key, target[key]]);
+  if (format === 'json') {
+    return `${JSON.stringify({
+      format: 'dpx-env-use',
+      schemaVersion: 1,
+      environment: name,
+      envRoot: paths.root,
+      unset: SHELL_UNSET_KEYS,
+      pathPrepend: [paths.npmPrefix],
+      set: Object.fromEntries(assignments),
+    }, null, 2)}\n`;
+  }
+  if (format === 'cmd') {
+    const lines = [`rem dpx env use --${name}`, 'rem 用法: for /f "delims=" %i in (\'dpx env use --' + name + ' --format cmd\') do @%i'];
+    for (const key of SHELL_UNSET_KEYS) lines.push(`set "${key}="`);
+    for (const [key, value] of assignments) lines.push(`set "${key}=${value}"`);
+    lines.push(`set "PATH=${paths.npmPrefix};%PATH%"`);
+    return `${lines.join('\r\n')}\r\n`;
+  }
+  if (format !== 'powershell') {
+    throw new Error(`Unsupported shell format ${JSON.stringify(format)}. Supported formats: ${SHELL_FORMATS.join(', ')}.`);
+  }
+  const quote = value => `'${String(value).replace(/'/g, "''")}'`;
+  const lines = [`# dpx env use --${name}`, '# 用法: dpx env use --' + name + ' --format powershell | Invoke-Expression'];
+  for (const key of SHELL_UNSET_KEYS) lines.push(`Remove-Item Env:${key} -ErrorAction SilentlyContinue`);
+  for (const [key, value] of assignments) lines.push(`$env:${key} = ${quote(value)}`);
+  lines.push(`$env:PATH = ${quote(paths.npmPrefix)} + ';' + $env:PATH`);
+  return `${lines.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// `dpx plugin`: install into a profile without depending on ambient pnpm state
+// ---------------------------------------------------------------------------
+
+/**
+ * Complete a `dsh plugin` invocation with the flags that keep a profile's
+ * existing `node_modules` valid.
+ *
+ * `dsh plugin` is a thin pnpm forwarder that also reconciles the profile's
+ * bundle list, so dpx drives it rather than calling pnpm directly. What dpx
+ * adds is the one piece of context the forwarder cannot know: which store the
+ * profile is already linked from. Passing it explicitly is what turns
+ * `ERR_PNPM_UNEXPECTED_STORE` from a failure into a non-event.
+ */
+export function pluginArguments({ args, storeDir }) {
+  if (args.length === 0) throw new Error('dpx plugin add needs at least one package spec, for example: dpx plugin add --<name> <package> --profile <profile>');
+  const explicit = args.some(arg => arg === '--store-dir' || arg.startsWith('--store-dir='));
+  return [...args, ...(storeDir && !explicit ? ['--store-dir', storeDir] : [])];
+}
+
+/**
+ * What a profile declares, together with the version actually installed there
+ * and the version of the same package in the environment's npm prefix.
+ *
+ * Reading the install back is the point: plenty of "I installed it and nothing
+ * changed" reports are really "the launcher and the profile are two different
+ * copies", and only a read-back can say which one moved.
+ */
+export function profileInstalledPackages(paths, profile) {
+  const directory = profileDirectory(paths, profile);
+  let dependencies;
+  try {
+    const raw = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+    dependencies = Object.keys(raw?.dependencies ?? {});
+  } catch {
+    return [];
+  }
+  return dependencies.map(packageName => {
+    const installed = join(directory, 'node_modules', ...packageName.split('/'));
+    const version = existsSync(installed) ? packageVersionAt(installed) : undefined;
+    const globalPackage = locatePackage(paths, packageName);
+    const globalVersion = globalPackage ? packageVersionAt(globalPackage) : undefined;
+    return {
+      package: packageName,
+      ...(version === undefined ? {} : { version }),
+      ...(globalVersion === undefined ? {} : { globalVersion }),
+      ...(version === undefined || globalVersion === undefined ? {} : { match: version === globalVersion }),
+    };
+  });
+}
+
 export function commandUsage() {
   return `dpx — isolated DeepSeek Harness environments\n\n` +
     `Create and install:\n  dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --D:\\DevEnvs\\Projects\n  dpx npm install -g @deepseek-ai/dsh --test --D:\\DevEnvs\\Projects --no-desktop\n\n` +
-    `Reuse an environment:\n  dpx npm install -g @deepseek-harness-tui/dsh-tui --test\n  dpx run --test dsh-tui\n  dpx run --test dsh -- web --no-open\n\n` +
+    `Reuse an environment:\n  dpx npm install -g @deepseek-harness-tui/dsh-tui --test\n  dpx run --test dsh-tui\n  dpx run --test dsh -- web --no-open\n  dpx exec --test -- npm ls -g --depth=0\n\n` +
+    `Ask which copy you are about to use (never guesses, never runs it):\n  dpx which --test\n  dpx which --test dsh-tui\n  dpx env doctor --test\n\n` +
+    `Enter an environment in the current shell:\n  dpx env use --test --format powershell | Invoke-Expression\n  dpx env use --test --format cmd\n\n` +
+    `Manage a profile's plugins with an explicit store:\n  dpx plugin add --test <package>[@version|tarball] --profile dsh-tui\n\n` +
     `Desktop launcher (Windows):\n  dpx desktop status --test\n  dpx desktop check  --test\n  dpx desktop update --test\n  dpx desktop install --test --source github:T-Auto/dsh-dpx\n\n` +
     `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx env remove --test --purge\n  dpx descriptor --test\n\n` +
     `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments. New Windows environments receive a desktop EXE unless --no-desktop is supplied.\n` +
