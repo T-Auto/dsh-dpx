@@ -2,7 +2,52 @@
 
 本路线图只描述 DPX 自己创建、登记或拥有的资源的生命周期。原则是：**DPX 注册由 DPX 管，DPX 创建的环境由 DPX 显式清理；绝不要求用户手改 registry、Windows Registry 或散落的状态目录。**
 
-> 当前状态：`dpx` 可创建、安装、运行和发现隔离环境；尚未提供删除/注销命令。直接手动删除环境根目录会在 DPX registry 留下失效记录，因此不应作为推荐卸载方式。
+> 当前状态：`dpx` 可创建、安装、运行、发现、诊断和注销隔离环境（`dpx env remove [--purge]`）。
+
+## Milestone 6 — 运行时身份与跨环境可用性（已实现）
+
+隔离的三个面（`PATH` / `npm-prefix` / `DSH_HOME`）以前只在 `dpx` 进程内是绑在一起的：离开 `dpx run`
+之后，终端里裸敲一个命令名命中的是 `PATH` 里第一个同名文件，可能是宿主机或其他环境的那一份，
+它会连带使用那套副本自己的 DSH 状态。设计文档：`dpx-隔离路径设计评审.md`。
+
+### 实现结果
+
+1. **环境身份变量**：`dpx run` / `dpx exec` / `dpx env use` 与桌面启动器都给子进程设置
+   `DSH_DPX_ENV` / `DSH_DPX_ENV_ROOT`，并传播 `DPX_HOME`。任何进程（包括 agent 在环境内再启动的 `dpx`）
+   都能直接回答“我在哪个环境里”，而不是从 `DSH_HOME` 或路径反推。
+2. **`dpx which --<name> [target]`**：离线预测“会命中谁”——环境内副本（绕过 `PATH` 与 shim）、
+   该目标在 `npm-prefix` 与每个 profile 中的全部副本及版本、`PATH` 上每个同名文件（标注 `winner`
+   与 `inEnvironment`）、`verdict`（`clean` / `host-leak` / `not-installed`）与一行可执行的 `advice`
+   （命中环境外副本时同时报出它将会使用的 `DSH_HOME`）。
+3. **`dpx env doctor --<name>`**：一次输出 registry 绑定、受控布局、生成指令文件格式、当前进程身份、
+   registry 归属、`PATH` 冲突、全局副本 ↔ profile 副本版本、每个 profile 的安装器与 store；
+   每条结论都附带可执行修法，`error` 级问题使退出码非零。
+4. **`dpx exec --<name> [--cwd <dir>] -- <命令> …`**：在环境内运行任意命令（`dpx run` 只覆盖已知启动目标）。
+5. **`dpx env use --<name> --format powershell|cmd|json`**：打印可求值脚本，把“当前 shell”切进环境；
+   dpx 永不修改父进程环境。脚本按“前置、不替换”的约定处理 `PATH`。
+6. **`dpx plugin add --<name> <spec> [--profile <p>] [--store-dir <path>]`**：仍走 `dsh plugin`
+   （以保留 pnpm 安装与 bundle 层重建），但显式传入该 profile **既有 `node_modules` 的 store**，
+   把 `ERR_PNPM_UNEXPECTED_STORE` 从事后报错变成可预防；安装后回读 profile 内与全局两侧的版本。
+7. **registry 在环境内仍然可达**：环境的 `LOCALAPPDATA` 被隔离，而 DPX registry 默认正落在
+   `%LOCALAPPDATA%\DSH\DPX`；现在解析顺序为 `DPX_HOME` → 平台默认（若已存在 `registry.json`）→
+   本机发现指针（仅当 `DSH_DPX_ENV_ROOT` 证明当前进程在环境内），使环境内的 `dpx` 看到同一份 registry。
+8. **环境级 `AGENTS.md`（生成块 v2）**：新增“先确认你在哪一套里”、装载方式、dpx 通用开发规则与
+   已知失败模式；生成块作为**随包发布的内容**，只包含 dpx 通用规则，路径全部来自渲染时的环境布局。
+
+### 验收与测试
+
+- `test/identity.test.js`：身份变量、registry 回落、`PATH` 预测、`which` 三种 verdict、
+  `doctor` 的双侧版本 / `PATH` 冲突 / store 撕裂 / 旧格式指令文件 / 进程身份、
+  三种格式的 `env use`（PowerShell 脚本在真实 PowerShell 中求值验证）、`plugin add` 的 store 选择、
+  以及“生成块不含任何本机字面路径”（用合成环境根断言）。
+- `test/cli.test.js`：`which` / `env doctor` / `env use` / `exec` / `plugin add` 的黑盒 CLI 行为与退出码。
+- 手工端到端：一次性隔离环境中安装 DSH + TUI → `which` 判定宿主机泄漏 → 清空 `PATH` 后判定 clean →
+  `plugin add` 真实初始化 profile 并 pin 住环境内 store → `doctor` 全绿 → `dpx run` 启动真实 DSH →
+  `env use` 后 `Get-Command dsh` 命中该环境副本 → `dpx env remove --purge` 清理。
+
+### 仍未做
+
+- registry 级（不带 `--<name>`）的 `dpx env doctor`，用于列出所有“root 已缺失”的失效记录。
 
 ## 目标
 
@@ -170,16 +215,17 @@ Release 分发，契约见 [`docs/desktop-release.md`](docs/desktop-release.md)�
 
 ---
 
-## Milestone 3 — 清理诊断与维护
+## Milestone 3 — 清理诊断与维护（部分实现）
 
-新增只读诊断命令：
+`dpx env doctor --<name>` 已实现（见 Milestone 6），覆盖的环境内检查比这里最初设想的更多。
+仍未做的是**registry 级**（不带 `--<name>`）的只读体检：
 
 ```powershell
 # 列出 registry 中 root 已缺失的环境
- dpx env doctor
+dpx env doctor
 
-# JSON 输出，供自动化消费
- dpx env doctor --json
+# JSON 输出，供自动化消费（`--<name>` 形式已固定输出 JSON）
+dpx env doctor --json
 ```
 
 检查项：
@@ -210,4 +256,7 @@ Release 分发，契约见 [`docs/desktop-release.md`](docs/desktop-release.md)�
    使“升级 DSH”与“升级 desktop 封装”彻底分离。
 4. 补 Milestone 5 的进程级隔离（按环境的单实例互斥 + 子进程作业对象），
    使多个环境可以安全地同时运行。
-5. 最后补 Milestone 3 的只读诊断；不把诊断变成隐式修复或自动删除。
+5. 补 Milestone 6 的运行时身份与跨环境可用性（身份变量、`which` / `doctor` / `exec` / `env use` /
+   `plugin add`、registry 可达性与生成块 v2），使“我在哪一套里”成为可查询事实，
+   而不是需要记在脑子里的规则。
+6. 最后补 Milestone 3 的 registry 级只读体检；不把诊断变成隐式修复或自动删除。

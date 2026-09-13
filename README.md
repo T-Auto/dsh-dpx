@@ -182,6 +182,7 @@ EXE 本身不内嵌 Node 或 DSH，运行时需要已安装 Node.js 和 Windows 
 | 托盘图标左键 | 恢复主窗口 |
 | 托盘图标右键 | `打开主窗口` / `设置` / `重启 DSH 服务` / `关闭程序` |
 | `设置 → 关闭窗口` | 随时在“缩小到托盘图标 / 关闭程序 / 每次询问”之间切换 |
+| `设置 → 服务 → 在本环境中打开终端` | 打开一个 `cmd` 窗口，其 `PATH` / `DSH_HOME` / `DSH_DPX_ENV*` 与桌面端启动 DSH 时**完全一致**（工作目录为 `<环境根>\workspace`），用来当场确认一条命令命中哪一套副本 |
 
 “关闭程序”会回收该环境内的 DSH 子进程树；缩小到托盘只是隐藏窗口，DSH 仍在后台运行。
 
@@ -198,6 +199,10 @@ EXE 本身不内嵌 Node 或 DSH，运行时需要已安装 Node.js 和 Windows 
 | 设置 / 日志 / 托盘状态 / WebView2 数据 / 更新暂存 | 每个环境一份 | 全部位于 `<环境根>\desktop-state\`，不使用任何共享目录 |
 
 > 升级说明：`0.1.0` 的启动器使用 Tauri 单实例插件，因此**两个环境不能同时运行**（后启动的那个会立即退出，并把先启动的窗口弹到前台）。`0.2.0` 起改为上面的按环境隔离实现；旧环境的 EXE 用 `dpx desktop update --<环境名>` 升级即可。
+>
+> `0.2.5` 起，启动器还会给 DSH 子进程设置环境身份变量（`DSH_DPX_ENV` / `DSH_DPX_ENV_ROOT`），
+> 并在设置窗口提供“在本环境中打开终端”。环境的 `dsh-home\AGENTS.md` 里写明了它们的用途；
+> 用 `dpx desktop update --<环境名>` 升级，重启后生效。
 
 ### 桌面封装的更新（GitHub Release）
 
@@ -256,17 +261,39 @@ dpx run --test dsh web --no-open
 
 # 将参数原样转发给 test 环境的 DSH
 dpx run --test dsh --version
+
+# 在 test 环境里跑任意命令（这里不限于 DSH/TUI）
+dpx exec --test -- npm ls -g --depth=0
+dpx exec --test --cwd D:\some\checkout -- git status
+
+# 先问“裸敲某个名字会命中谁”，再决定怎么跑（只读，不启动任何东西）
+dpx which --test
+dpx which --test dsh-tui
+
+# 一次性体检：registry / 布局 / PATH 冲突 / 双侧版本 / profile 的安装器与 store
+dpx env doctor --test
+
+# 把“当前 shell”切进 test 环境（dpx 不改父进程，只打印可求值的脚本）
+dpx env use --test --format powershell | Invoke-Expression
+dpx env use --test --format cmd
 ```
 
-每次 `dpx run` 都会为子进程设置环境专属的绝对路径：
+每次 `dpx run` / `dpx exec` 都会为子进程设置环境专属的绝对路径：
 
 ```text
 DSH_HOME=<环境根>\dsh-home
 DSH_AGENTS_HOME=<环境根>\agents-home
+DSH_DPX_ENV=<环境名>                  # 环境身份：我是哪一个环境
+DSH_DPX_ENV_ROOT=<环境根>             # 环境身份：环境根在哪
+DPX_HOME=<DPX registry home>          # 让环境内再启动的 dpx 找到同一个 registry
 HOME / USERPROFILE / APPDATA / LOCALAPPDATA / TEMP / TMP
 XDG_CONFIG_HOME / XDG_CACHE_HOME / XDG_DATA_HOME
 PATH=<环境根>\npm-prefix;…
 ```
+
+`DSH_DPX_ENV` / `DSH_DPX_ENV_ROOT` 是**环境身份**：`DSH_HOME` 只说明 DSH 的状态在哪，除了 DSH 自己没人读它，
+也无法据此区分“宿主机”和“某个环境”。这两个变量让任何进程——包括 agent 在环境里再启动的 `dpx`——
+都能直接回答“我在哪个环境里”，而不必从路径反推。
 
 注意这里**没有** `NPM_CONFIG_PREFIX` / `NPM_CONFIG_CACHE`：dsh-dpx 不再劫持 npm 的默认值（见下文[「npm 在隔离环境里是原生的」](#npm-在隔离环境里是原生的)）。
 
@@ -337,16 +364,97 @@ corepack enable pnpm
 <环境根>\dsh-home\AGENTS.md
 ```
 
-内容由环境自身布局生成，包含：
+内容由环境自身布局生成：
 
-- **你在哪个隔离环境里运行**：环境名、环境根、`DSH_HOME`、本文件位置；
-- **这个隔离环境是怎么设计的**：`npm-prefix` / `npm-cache` / `dsh-home` / `agents-home` / `home` / `appdata` / `tmp` / `xdg-*` / `workspace` / `desktop` 各是什么、哪个环境变量指向它；
-- **npm 的行为**：原生默认会落到 `<环境根>\appdata\npm`（不在 `PATH` 上、没人会去那里找包），要装进环境必须 `--prefix` + `--cache`（或 `dpx npm install`），并给出可直接复制的命令；
+- **先确认你在哪一套里**：环境身份变量、`dpx which` / `dpx env doctor` 的用法，以及“裸敲命令名命中环境外副本”时会发生什么；
+- **这个隔离环境是怎么设计的**：`npm-prefix` / `npm-cache` / `dsh-home` / `profiles` / `agents-home` / `home` / `appdata` / `tmp` / `xdg-*` / `workspace` / `desktop` 各是什么、哪个环境变量指向它；
+- **怎么往这个环境里装东西**：npm 全局包（`dpx npm install` 或显式 `--prefix` + `--cache`）与 profile 插件（`dpx plugin add`，含 store 约定），并给出可直接复制的命令；
+- **dpx 通用开发规则**：不要假设默认解析落在环境内、跨环境操作必须显式指名环境、区分全局副本与 profile 副本、不要改宿主机与其他环境、报错先取证；
+- **已知失败模式**：装包不生效 / `ERR_PNPM_UNEXPECTED_STORE` / launcher ↔ profile 版本不一致 / 环境内看不到别的环境；
 - **边界**：隔离只收容默认解析、不是沙箱，以及不要动其他环境。
+
+这份生成块是**随包发布的内容**：它只讲 dpx 的通用规则，所有具体路径都来自它所描述的那个环境（渲染时注入），
+不写死任何主机路径、检出位置或某个具体产品。回归测试 `test/identity.test.js` 用合成环境根断言了这一点。
 
 因为 `DSH_HOME` 指向该目录，**不管环境是怎么启动的**——`dpx run --test dsh web`、`dpx run --test dsh-tui`、还是双击 `<环境根>\desktop\DSH DeepSeek Harness Desktop.exe`——DSH 都会把这同一个文件当作环境级全局指令读进来。
 
 该文件由 dpx 托管：`<!-- dpx:environment-guide:begin … -->` 与 `<!-- dpx:environment-guide:end -->` 之间的内容会自动刷新，你自己写的全局指令放在标记块之外即可，不会被覆盖。用 `--no-desktop` 创建的环境同样会得到这个文件。
+
+### 「我现在用的是哪一套？」：`dpx which` 与 `dpx env doctor`
+
+隔离的三个面（`PATH` / `npm-prefix` / `DSH_HOME`）以前只在 `dpx` 进程内是**绑在一起**的：一旦离开 `dpx run`，
+这层绑定就消失了，终端里裸敲 `dsh` / `dsh-tui` 命中的是 `PATH` 里第一个同名文件——可能是宿主机那份，
+它会连带使用宿主机自己的 DSH 状态，于是“我在环境里装了东西，界面却没变化”。
+
+两条命令把这个知识变成可查询的事实，**都不启动目标、都不读网络**：
+
+```powershell
+dpx which --test              # 每个已识别启动目标：环境内副本 + PATH 上会命中谁
+dpx which --test dsh-tui      # 只看一个目标
+dpx env doctor --test         # 环境自洽性体检（退出码非零 = 有 error 级问题）
+```
+
+`dpx which` 的输出包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `isolated` | `dpx run --test <target>` 会直接执行的入口（绕过 `PATH` 与 shim）及其版本 |
+| `copies` | 该目标在 `npm-prefix` 与每个 `profiles\<profile>` 中的**全部**副本及版本 |
+| `ambientPath` | `PATH` 上每个同名文件，按命中顺序；`winner` 标出真正会跑的那个，`inEnvironment` 标出它是否在本环境内 |
+| `verdict` | `clean` / `host-leak` / `not-installed` |
+| `advice` | 可直接照做的一行修法（命中环境外副本时，会连它将要使用的 `DSH_HOME` 一起报出来） |
+
+`dpx env doctor` 逐项检查并把每条结论都配上一句可执行的修法：
+
+| 检查 | 说明 |
+| --- | --- |
+| `registry-binding` / `layout` | registry 记录、环境根、`DSH_HOME`、`npm-prefix` 是否互相对得上；受控布局是否齐全 |
+| `environment-guide` | `dsh-home\AGENTS.md` 是否存在且为当前格式（旧格式只提示，不报错） |
+| `process-identity` | 当前进程属于哪个环境（读 `DSH_DPX_ENV_ROOT`），而不是猜 |
+| `registry-membership` | 当前 DPX registry 里是否登记了这个环境 |
+| `path-shadowing:<target>` | `PATH` 上是否同名副本会抢在环境之前（宿主机泄漏） |
+| `target-copies:<target>` | 全局副本与各 profile 副本的版本是否一致（不一致 = 今天 `launcher ↔ profile` 报错的根因） |
+| `profile-store:<profile>` | profile 的 `node_modules` 由哪个包管理器装、链接自哪个 store；store 落在环境外时**直接给出 `ERR_PNPM_UNEXPECTED_STORE` 的预防性修法** |
+
+### 在环境里跑命令：`dpx exec` 与 `dpx env use`
+
+`dpx run` 覆盖 dpx 已知的启动目标；`dpx exec` 覆盖其余一切（`npm` / `pnpm` / `node` / `git` / 又一个 `dpx`），
+子进程拿到与 `dpx run` **完全相同**的环境：
+
+```powershell
+dpx exec --test -- npm ls -g --depth=0
+dpx exec --test --cwd D:\some\checkout -- pnpm install
+```
+
+dpx 不能修改父 shell 的环境（这是操作系统的事实，不是实现偷懒），所以“让当前终端进入环境”由 `dpx env use` **打印**一段可求值的脚本完成：
+
+```powershell
+# PowerShell
+dpx env use --test --format powershell | Invoke-Expression
+# cmd
+for /f "delims=" %i in ('dpx env use --test --format cmd') do @%i
+# 机器可读（给 agent / 脚本用）
+dpx env use --test --format json
+```
+
+脚本包含 `DSH_HOME` / `DSH_AGENTS_HOME` / 环境身份 / `DPX_HOME` / `HOME` / `XDG_*` 等赋值，
+清除 `NODE_OPTIONS` / `NODE_PATH` / `NPM_CONFIG_*`，并按 “**前置、不替换**” 的约定把
+`<环境根>\npm-prefix` 加到**求值那一刻**的 `PATH` 前面。dpx 自己永不修改父进程环境。
+
+### 往 profile 里装插件：`dpx plugin add`
+
+DSH 的 profile 插件由 `dsh plugin --profile <p> add …` 转发给 pnpm，并在安装后重建 profile 的 bundle 层；
+dpx 不绕过它，而是补上它无法知道的那一条上下文——**这个 profile 的 `node_modules` 原本链接自哪个 store**：
+
+```powershell
+dpx plugin add --test <包名[@版本|tarball路径]> --profile dsh-tui
+dpx plugin add --test <包名> --profile dsh-tui --dry-run   # 只打印将执行的命令与 store
+dpx plugin add --test <包名> --profile dsh-tui --store-dir "C:\existing\store\v11"
+```
+
+- store 的取值顺序：`--store-dir` 显式指定 → 从 `profiles\<p>\node_modules\.modules.yaml` 读到的既有 store → 环境默认 store（`<环境根>\xdg-data\pnpm\store`）；
+- 安装后**回读**真实安装结果：`profiles\<p>\package.json` 的每个依赖在 profile 内与 `npm-prefix` 内的版本、以及两者是否一致；
+- 失败时不再把 pnpm 的原文错误直接抛给调用者，而是附上 `dpx env doctor` 的排查入口与保持既有链接的修法。
 
 ### 隔离的边界：收容「默认解析」，不是写入沙箱
 
@@ -359,8 +467,23 @@ corepack enable pnpm
 | XDG 三件套 | `<环境根>\xdg-config`、`<环境根>\xdg-cache`、`<环境根>\xdg-data` |
 | pnpm store | `<环境根>\xdg-data\pnpm\store` |
 | DSH 状态与配置 | `<环境根>\dsh-home`、`<环境根>\agents-home` |
+| 环境身份 | `DSH_DPX_ENV`、`DSH_DPX_ENV_ROOT`（任何进程都能据此回答“我在哪个环境里”） |
+| DPX registry home | `DPX_HOME` 显式传入；未传时按平台默认，并在环境内回落到本机发现指针（见下） |
 | npm 原生默认 prefix / cache | `<环境根>\appdata\npm`、`<环境根>\localappdata\npm-cache`（环境内，但**不在 `PATH` 上**） |
 | dpx 管理的 npm prefix / cache | `<环境根>\npm-prefix`、`<环境根>\npm-cache`（需显式 `--prefix` / `--cache`，见上一节） |
+
+#### DPX registry 在环境内仍然可达
+
+环境的 `LOCALAPPDATA` 是隔离的，而 DPX registry 的默认位置正是 `%LOCALAPPDATA%\DSH\DPX`——
+于是“在环境里再启动一个 `dpx`”会看到一个**私有的、空的** registry，一个环境都列不出来，
+这与“多环境互相开发”的目标正好相反。因此 registry home 的解析顺序是：
+
+1. `DPX_HOME`（显式设置，永远优先；`dpx run` / `dpx exec` / `dpx env use` 都会把它传给子进程）；
+2. 平台默认位置，若该处**已存在** `registry.json`；
+3. 若当前进程能证明自己在某个 dpx 环境里（`DSH_DPX_ENV_ROOT` 已设置）而第 2 步没有命中，
+   则回落到本机的 DPX 发现指针 `HKCU\Software\DSH\DPX\RegistryPath` 所指向的那个 registry。
+
+`dpx env doctor` 会报出当前使用的 registry home，以及这个环境是否登记在其中。
 
 三条命令即可确认当前的实际落点：
 
@@ -458,6 +581,12 @@ dpx env list
 
 # test 的隔离路径和实例 ID
 dpx env show --test
+
+# test 的环境自洽性体检（registry / 布局 / PATH 冲突 / 双侧版本 / profile store）
+dpx env doctor --test
+
+# test 里每个已识别启动目标：环境内副本 + PATH 上会命中谁
+dpx which --test
 
 # test 的 DistributionDescriptor、EnvironmentInstance、DiscoverableEntry 信息
 dpx descriptor --test
