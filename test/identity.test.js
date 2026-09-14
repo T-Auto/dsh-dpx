@@ -450,6 +450,15 @@ test('the published guide carries rules, not this machine', async () => {
   for (const needle of ['dpx which', 'dpx env doctor', 'dpx env use', 'dpx exec', 'dpx plugin add', DPX_ENV_ROOT_VARIABLE, 'ERR_PNPM_UNEXPECTED_STORE']) {
     assert.ok(guide.includes(needle), `guide should mention ${needle}`);
   }
+  // The two hand-editing traps that a Windows host hits while operating an
+  // environment, both carried into every generated guide:
+  //   - PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, and Node's
+  //     `readFileSync(path, 'utf8')` does not strip it, so the next `JSON.parse`
+  //     of a profile manifest throws and the app cannot start;
+  //   - a build command reporting success is not proof the artifact is correct.
+  for (const needle of ['Set-Content -Encoding utf8', 'UTF8Encoding($false)', '产物正确']) {
+    assert.ok(guide.includes(needle), `guide should carry the hand-editing trap: ${needle}`);
+  }
   // And the real environment still gets its own paths, not placeholders.
   const { record, paths } = await environment('published');
   const real = renderEnvironmentGuide(paths, { name: record.name, version: '0.1.0' });

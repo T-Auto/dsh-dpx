@@ -167,6 +167,10 @@ dsh-dpx 不劫持 npm：\`dpx run\`、\`dpx exec\` 与桌面启动器都不设�
 5. **报错先取证再改**：把 \`dpx env doctor --${name_}\` 的结论、原始命令与完整输出一起报告；
    不要用“重建环境”“删除 node_modules”这类破坏性手段试探。
 6. **需要真正的文件系统隔离/沙箱**时，在本机沙箱或容器层实现；dpx 只负责环境身份、受控布局与默认路径收容。
+7. **别把“命令成功”当成“产物正确”**：构建命令报成功、测试套件全绿，都**不能**证明装出去的那份是对的。
+   实测踩过：\`pnpm compile\` 报成功，\`lib/\` 里却是旧产物（上一次编译中途失败留下的），而所有门禁仍然全绿——
+   因为回归脚本读的是源码，出货走的是产物，两者不是同一份。每次“装进环境 / 装进全局”之后，
+   至少做一次**产物级**核验：解包后检查关键符号、或比对各副本哈希，不要只信退出码。
 
 ## 4. 已知失败模式
 
@@ -186,6 +190,16 @@ dsh-dpx 不劫持 npm：\`dpx run\`、\`dpx exec\` 与桌面启动器都不设�
   判定“我在环境里”所依赖的身份变量又可能被启动链上的终端层丢掉（见上一节）。
   **处置**：dpx 会用 \`DSH_HOME\` / 隔离的 \`LOCALAPPDATA\` 旁的 \`${ENVIRONMENT_MANIFEST_NAME}\` 反推环境根，
   并据此回落到本机的 DPX 发现指针（\`HKCU\\Software\\DSH\\DPX\`）；仍不对时显式设置 \`DPX_HOME\`。
+- **症状**：改过环境的某个 JSON 配置后，程序启动即抛
+  \`SyntaxError: Unexpected token '', "{ "... is not valid JSON\`。
+  **原因**：本机的 \`pwsh\` 可能是 **Windows PowerShell 5.1**（\`$PSVersionTable.PSEdition\` = \`Desktop\`），
+  它的 \`Set-Content -Encoding utf8\` 会写入 **UTF-8 BOM**；而 Node 的
+  \`readFileSync(path, 'utf8')\` **不剥 BOM**，下游 \`JSON.parse\` 直接撞上 \`U+FEFF\`。
+  实测：\`~/.dsh/profiles/<profile>/package.json\` 首字节变成 \`EF BB BF 7B\`，TUI 完全起不来。
+  **处置**：用 \`[System.IO.File]::WriteAllText($p, $json, (New-Object System.Text.UTF8Encoding($false)))\`
+  （或 \`::AppendAllText(...)\`）写无 BOM；改完 **用 \`node -e "JSON.parse(...)"\` 验一遍**，
+  不要只看 PowerShell 的退出码。同理别用 \`ConvertTo-Json | Set-Content\` 整对象重写 manifest：
+  那一路既带 BOM 又带 PowerShell 的格式化风格，之后 \`diff\` 会一直有噪声。
 
 ## 边界
 
