@@ -40,6 +40,17 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long the shell waits for a helper process it started (in practice
+/// `taskkill`) before killing the helper and moving on.
+const TASKKILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the DSH child gets to disappear after being asked to die.
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Hard deadline for the whole shutdown. Nothing on this path may wait forever:
+/// the shell is going away, and the job object ([`job::ChildJob`]) already
+/// guarantees the DSH child tree dies with this process either way.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -66,14 +77,54 @@ struct Inner {
     child: Option<Child>,
     log: String,
     pending_close: bool,
+    /// Set once the shutdown teardown has been claimed, so a second close click
+    /// (or a second tray "关闭程序") cannot start a competing `taskkill`.
+    quitting: bool,
+    /// Set while a restart teardown + relaunch is in flight, for the same reason.
+    restarting: bool,
 }
 
 #[derive(Clone, Default)]
 struct AppState(Arc<Mutex<Inner>>);
 
 impl AppState {
+    /// Lock the shell state, recovering from a poisoned mutex.
+    ///
+    /// Every window event, every tray action and every Tauri command locks this
+    /// state, so one panicking thread holding the lock must not be able to turn
+    /// the whole shell into "no click ever does anything again". A poisoned lock
+    /// only means some thread panicked mid-update; the shell is better off
+    /// reading the state it has than panicking on every later event.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Claim the shutdown. Returns `true` for the first caller only.
+    fn begin_shutdown(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.quitting {
+            return false;
+        }
+        inner.quitting = true;
+        true
+    }
+
+    /// Claim the DSH restart. Returns `true` only when no restart is in flight.
+    fn begin_restart(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.restarting || inner.quitting {
+            return false;
+        }
+        inner.restarting = true;
+        true
+    }
+
+    fn end_restart(&self) {
+        self.lock().restarting = false;
+    }
+
     fn set_error(&self, message: String) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.lock();
         if inner.status.state == "starting" {
             inner.status.state = "error";
             inner.status.message = Some(message);
@@ -81,7 +132,7 @@ impl AppState {
     }
 
     fn log_tail(&self, max_chars: usize) -> String {
-        let inner = self.0.lock().unwrap();
+        let inner = self.lock();
         let log = inner.log.trim();
         if log.chars().count() <= max_chars {
             return log.to_string();
@@ -118,46 +169,147 @@ pub fn log_ui(_app: &AppHandle, message: &str) {
     }
 }
 
+/// Run a helper process to completion, but never for longer than `limit`.
+///
+/// Every wait on the shutdown path is bounded on purpose. This used to be a
+/// plain `.status()` followed by `Child::wait()` — both unbounded — and both ran
+/// on the UI thread, so a `taskkill /T /F` that stalled against a large or partly
+/// unkillable child tree parked the window in "not responding" with nothing in
+/// the log to explain it.
+///
+/// Returns `None` when the helper outlived its deadline (it is killed first).
+fn run_bounded(command: &mut Command, limit: Duration) -> Option<std::process::ExitStatus> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.try_wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Stop the DSH child process tree.
+///
+/// Callers must run this off the UI thread: killing a long-running DSH tree
+/// (node plus every shell, agent and MCP process it spawned) takes as long as it
+/// takes, and the shell has to stay responsive while it happens.
 fn kill_child(state: &AppState) {
-    let child = state.0.lock().unwrap().child.take();
+    let child = state.lock().child.take();
     let Some(mut child) = child else { return };
+    let pid = child.id();
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        if run_bounded(&mut command, TASKKILL_TIMEOUT).is_none() {
+            if let Ok(root) = env_root() {
+                log_line(
+                    &root,
+                    &format!("taskkill /T /F (pid {pid}) did not finish within {}s; falling back to a direct kill", TASKKILL_TIMEOUT.as_secs()),
+                );
+            }
+        }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            if let Ok(root) = env_root() {
+                log_line(
+                    &root,
+                    &format!("DSH child (pid {pid}) was still alive after {}s; leaving it to the job object", CHILD_EXIT_TIMEOUT.as_secs()),
+                );
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Stop the DSH child process tree and exit the shell.
+///
+/// The teardown runs on its own thread, never on the caller's: this is called
+/// from the window's close handler (the UI thread) and from Tauri commands, and a
+/// UI thread parked inside `taskkill`/`wait` is exactly what "the window stopped
+/// responding" looks like. The window is hidden immediately so the click has
+/// visible feedback, and a deadline thread guarantees the process leaves even if
+/// the teardown itself wedges.
 pub fn quit(app: &AppHandle) {
-    kill_child(&app.state::<AppState>());
-    app.exit(0);
+    let state = app.state::<AppState>();
+    if !state.begin_shutdown() {
+        return;
+    }
+    windows::set_main_visible(app, false);
+    let teardown_app = app.clone();
+    let teardown_state = state.inner().clone();
+    std::thread::spawn(move || {
+        kill_child(&teardown_state);
+        teardown_app.exit(0);
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(SHUTDOWN_GRACE);
+        if let Ok(root) = env_root() {
+            log_line(
+                &root,
+                &format!(
+                    "shutdown did not finish within {}s; exiting anyway (the job object takes the DSH child tree with us)",
+                    SHUTDOWN_GRACE.as_secs()
+                ),
+            );
+        }
+        std::process::exit(0);
+    });
 }
 
 /// Kill the running DSH child and start a fresh one in the same window.
+///
+/// Like [`quit`], the kill runs off the UI thread; a second request while a
+/// restart is already in flight is ignored rather than starting a second DSH
+/// child against the same environment.
 pub fn restart_service(app: &AppHandle) {
     let state = app.state::<AppState>();
-    kill_child(&state);
+    if !state.begin_restart() {
+        return;
+    }
     {
-        let mut inner = state.0.lock().unwrap();
+        let mut inner = state.lock();
         inner.status = Status::default();
         inner.log.clear();
         inner.pending_close = false;
     }
-    if let Err(error) = launch(&state, app) {
-        state.set_error(error);
-    }
+    let worker_app = app.clone();
+    let worker_state = state.inner().clone();
+    std::thread::spawn(move || {
+        kill_child(&worker_state);
+        if let Err(error) = launch(&worker_state, &worker_app) {
+            worker_state.set_error(error);
+        }
+        worker_state.end_restart();
+    });
 }
 
 #[tauri::command]
 fn webui_status(state: tauri::State<'_, AppState>) -> Status {
-    state.0.lock().unwrap().status.clone()
+    state.lock().status.clone()
 }
 
 #[tauri::command]
@@ -328,13 +480,13 @@ async fn apply_desktop_update(app: tauri::AppHandle) -> Result<ApplyResult, Stri
 
 #[tauri::command]
 fn close_request_pending(state: tauri::State<'_, AppState>) -> bool {
-    state.0.lock().unwrap().pending_close
+    state.lock().pending_close
 }
 
 #[tauri::command]
 fn resolve_close_request(app: tauri::AppHandle, state: tauri::State<'_, AppState>, action: String, remember: bool) -> Result<String, String> {
     let root = env_root()?;
-    state.0.lock().unwrap().pending_close = false;
+    state.lock().pending_close = false;
     windows::close(&app, windows::CLOSE_DIALOG);
     let action = action.trim().to_ascii_lowercase();
     if action == "cancel" {
@@ -350,7 +502,7 @@ fn resolve_close_request(app: tauri::AppHandle, state: tauri::State<'_, AppState
         // "Ask" cannot be resolved into an action; treat it as cancel.
         settings::CloseAction::Ask => {}
         settings::CloseAction::Tray => {
-            windows::hide(&app, windows::MAIN);
+            windows::hide_main(&app);
             log_line(&root, "close request: minimized to the notification area");
         }
         settings::CloseAction::Exit => {
@@ -497,26 +649,41 @@ pub fn run() {
                     }
                     settings::CloseAction::Tray => {
                         api.prevent_close();
-                        let _ = close_window.hide();
-                        log_line(&root, "close request: minimized to the notification area");
+                        windows::hide_main(&app);
+                        // Recorded because a hide that silently does nothing is
+                        // the whole symptom this line exists to make visible.
+                        let visible = windows::main_is_visible(&app);
+                        log_line(
+                            &root,
+                            &format!("close request: minimized to the notification area (window visible afterwards: {visible})"),
+                        );
                     }
                     settings::CloseAction::Ask => {
                         api.prevent_close();
                         {
                             let state = app.state::<AppState>();
-                            state.0.lock().unwrap().pending_close = true;
+                            state.lock().pending_close = true;
                         }
-                        if let Err(error) = windows::open_close_dialog(&app) {
-                            // Never trap the user in an unclosable window.
-                            log_line(&root, &format!("close dialog failed, hiding instead: {error}"));
-                            let _ = close_window.hide();
+                        // The dialog is a WebView2 window: building one inside
+                        // the WM_CLOSE dispatch can wedge the message loop, so
+                        // open it once this handler has returned.
+                        let dialog_app = app.clone();
+                        let dialog_root = root.clone();
+                        if let Err(error) = app.run_on_main_thread(move || {
+                            if let Err(error) = windows::open_close_dialog(&dialog_app) {
+                                // Never trap the user in an unclosable window.
+                                log_line(&dialog_root, &format!("close dialog failed, hiding instead: {error}"));
+                                windows::hide_main(&dialog_app);
+                            }
+                        }) {
+                            log_line(&root, &format!("close dialog could not be scheduled, hiding instead: {error}"));
+                            windows::hide_main(&app);
                         }
                     }
                 }
             });
 
-            let _ = window.show();
-            let _ = window.set_focus();
+            windows::show_main(&handle);
             #[cfg(windows)]
             {
                 // Let the next launch of this environment restore this window.
@@ -589,7 +756,7 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
     log_line(&root, &format!("spawned DSH (pid {}) with: {}", child.id(), plan.command_line()));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    state.0.lock().unwrap().child = Some(child);
+    state.lock().child = Some(child);
 
     if let Some(stdout) = stdout {
         let reader_state = state.clone();
@@ -602,7 +769,7 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
                 log_line(&log_root, &format!("stdout: {line}"));
                 if let Some(url) = dsh::extract_url(&line) {
                     {
-                        let mut inner = reader_state.0.lock().unwrap();
+                        let mut inner = reader_state.lock();
                         if inner.status.state == "starting" {
                             inner.status.state = "ready";
                             inner.status.url = Some(url.clone());
@@ -631,7 +798,7 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let exited = {
-                let mut inner = monitor_state.0.lock().unwrap();
+                let mut inner = monitor_state.lock();
                 if inner.status.state != "starting" {
                     return;
                 }
@@ -654,12 +821,23 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// How much of the DSH child's output the startup screen keeps in memory.
+const MAX_LOG_BYTES: usize = 200_000;
+
 fn append_log(state: &AppState, line: &str) {
-    let mut inner = state.0.lock().unwrap();
+    let mut inner = state.lock();
     inner.log.push_str(line);
     inner.log.push('\n');
-    if inner.log.len() > 200_000 {
-        let cut = inner.log.len() - 100_000;
+    if inner.log.len() > MAX_LOG_BYTES {
+        // `String::split_off` panics unless the index sits on a character
+        // boundary, and this buffer holds arbitrary child output — Chinese
+        // paths, agent text, stack traces. Splitting mid-character would take
+        // the reader thread down (and poison the state lock) over a *log line*,
+        // so walk back to a boundary instead.
+        let mut cut = inner.log.len() - MAX_LOG_BYTES / 2;
+        while cut > 0 && !inner.log.is_char_boundary(cut) {
+            cut -= 1;
+        }
         inner.log = inner.log.split_off(cut);
     }
 }
@@ -709,7 +887,10 @@ mod tests {
     use crate::dsh::extract_url;
     use crate::settings::{self, STATE_DIR};
     use crate::update;
+    use crate::{run_bounded, AppState, CHILD_EXIT_TIMEOUT, MAX_LOG_BYTES, SHUTDOWN_GRACE, TASKKILL_TIMEOUT};
     use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn desktop_state_is_below_environment_root() {
@@ -729,5 +910,95 @@ mod tests {
     #[test]
     fn url_extraction_is_shared_with_the_launcher() {
         assert!(extract_url("dsh web: http://127.0.0.1:1/?token=x").is_some());
+    }
+
+    /// Clicking X twice while the first shutdown is still tearing down the DSH
+    /// child must not start a second `taskkill`/teardown.
+    #[test]
+    fn a_shutdown_is_only_started_once() {
+        let state = AppState::default();
+        assert!(state.begin_shutdown());
+        assert!(!state.begin_shutdown());
+    }
+
+    /// The tray's "restart DSH" must not stack two DSH children on one
+    /// environment, and must not race a shutdown.
+    #[test]
+    fn a_restart_is_only_started_once_until_it_finishes() {
+        let state = AppState::default();
+        assert!(state.begin_restart());
+        assert!(!state.begin_restart(), "a second restart must wait for the first");
+        state.end_restart();
+        assert!(state.begin_restart());
+
+        let closing = AppState::default();
+        assert!(closing.begin_shutdown());
+        assert!(!closing.begin_restart(), "a restart must not start while the shell is exiting");
+    }
+
+    /// The shutdown path used to `wait()` without a deadline. A helper that
+    /// ignores its work must be abandoned at the deadline instead of parking the
+    /// shell.
+    #[test]
+    fn a_helper_that_outlives_its_deadline_is_abandoned() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "20", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("20");
+            command
+        };
+        let started = Instant::now();
+        let status = run_bounded(&mut command, Duration::from_millis(300));
+        assert!(status.is_none(), "a helper past its deadline must be reported as abandoned");
+        assert!(started.elapsed() < Duration::from_secs(5), "run_bounded must not outlive its deadline");
+    }
+
+    /// Every wait on the shutdown path has a deadline, and the whole teardown
+    /// stays well inside the range a user reads as "slow" rather than "hung".
+    #[test]
+    fn shutdown_waits_are_bounded() {
+        assert!(TASKKILL_TIMEOUT <= Duration::from_secs(10));
+        assert!(CHILD_EXIT_TIMEOUT <= Duration::from_secs(10));
+        assert!(
+            SHUTDOWN_GRACE <= TASKKILL_TIMEOUT + CHILD_EXIT_TIMEOUT + Duration::from_secs(5),
+            "the shutdown deadline must cover the bounded waits and still be short"
+        );
+    }
+
+    /// One panicking thread used to be enough to disable the shell: every window
+    /// event and command locks this state, and a poisoned `Mutex` made every
+    /// later `unwrap()` panic too — which is indistinguishable from "the window
+    /// stopped reacting".
+    #[test]
+    fn a_poisoned_state_lock_does_not_disable_the_shell() {
+        let state = AppState::default();
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock();
+            panic!("a shell thread panicked while holding the state lock");
+        })
+        .join();
+
+        assert!(state.begin_shutdown(), "the shell must still be able to act after a poisoned lock");
+        assert!(!state.begin_shutdown());
+        state.end_restart();
+    }
+
+    /// The in-memory log carries arbitrary child output, so truncating it must
+    /// never slice a multi-byte character in half.
+    #[test]
+    fn log_truncation_never_splits_a_character() {
+        let state = AppState::default();
+        let line = "环境日志".repeat(15_000);
+        for _ in 0..2 {
+            crate::append_log(&state, &line);
+        }
+        let log = state.lock().log.clone();
+        assert!(log.len() <= MAX_LOG_BYTES + line.len(), "the log must stay bounded, got {}", log.len());
+        assert!(log.chars().count() > 0);
+        assert!(log.contains('环') || log.contains('境'), "truncation must keep whole characters");
     }
 }
