@@ -11,7 +11,9 @@
 param(
   [Parameter(Mandatory = $true)][string]$Directory,
   [string]$Repository = 'T-Auto/dsh-dpx',
-  [switch]$Draft
+  [switch]$Draft,
+  # Release notes. Defaults to a one-liner naming the version.
+  [string]$Notes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,7 +33,8 @@ $tag = if ($manifest.tag) { $manifest.tag } else { "desktop-v$($manifest.version
 gh auth status | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'gh is not authenticated; run `gh auth login` first (this script never authenticates for you).' }
 
-$arguments = @('release', 'create', $tag, '--repo', $Repository, '--title', "Desktop launcher $($manifest.version)", '--notes', "dsh-dpx desktop launcher $($manifest.version).")
+$notes = if ($Notes) { $Notes } else { "dsh-dpx desktop launcher $($manifest.version)." }
+$arguments = @('release', 'create', $tag, '--repo', $Repository, '--title', "Desktop launcher $($manifest.version)", '--notes', $notes)
 if ($Draft) { $arguments += '--draft' }
 Write-Host "Creating release $tag in $Repository with:"
 Write-Host "  - $($manifest.assetName)"
