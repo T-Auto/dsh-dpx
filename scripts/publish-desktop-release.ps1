@@ -13,7 +13,11 @@ param(
   [string]$Repository = 'T-Auto/dsh-dpx',
   [switch]$Draft,
   # Release notes. Defaults to a one-liner naming the version.
-  [string]$Notes
+  [string]$Notes,
+  # Read the release notes from a file instead. Preferred for real notes:
+  # multi-line text with quotes or asterisks does not survive being passed
+  # through a command line.
+  [string]$NotesFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,8 +37,16 @@ $tag = if ($manifest.tag) { $manifest.tag } else { "desktop-v$($manifest.version
 gh auth status | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'gh is not authenticated; run `gh auth login` first (this script never authenticates for you).' }
 
-$notes = if ($Notes) { $Notes } else { "dsh-dpx desktop launcher $($manifest.version)." }
-$arguments = @('release', 'create', $tag, '--repo', $Repository, '--title', "Desktop launcher $($manifest.version)", '--notes', $notes)
+$arguments = @('release', 'create', $tag, '--repo', $Repository, '--title', "Desktop launcher $($manifest.version)")
+if ($NotesFile) {
+  # Hand the file to gh rather than its contents: a command line mangles
+  # multi-line notes (quotes, asterisks, newlines).
+  if (-not (Test-Path -LiteralPath $NotesFile)) { throw "Missing notes file: $NotesFile" }
+  $arguments += @('--notes-file', (Resolve-Path -LiteralPath $NotesFile).Path)
+} else {
+  $notes = if ($Notes) { $Notes } else { "dsh-dpx desktop launcher $($manifest.version)." }
+  $arguments += @('--notes', $notes)
+}
 if ($Draft) { $arguments += '--draft' }
 Write-Host "Creating release $tag in $Repository with:"
 Write-Host "  - $($manifest.assetName)"
