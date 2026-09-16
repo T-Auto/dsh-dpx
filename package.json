@@ -27,6 +27,7 @@
     "desktop:build": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1",
     "desktop:pack": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1 -OutputDirectory dist -SkipPackagedArtifact",
     "desktop:publish": "powershell -ExecutionPolicy Bypass -File scripts/publish-desktop-release.ps1 -Directory dist",
+    "desktop:verify:window": "powershell -ExecutionPolicy Bypass -File scripts/verify-desktop-shell-window.ps1",
     "pack:check": "npm pack --dry-run"
   },
   "keywords": [
