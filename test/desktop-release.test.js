@@ -451,6 +451,27 @@ test('the github api base is selectable by argument or environment', () => {
   assert.equal(desktopGithubApi('http://example.test/', { DPX_GITHUB_API: 'http://ignored.test' }), 'http://example.test');
 });
 
+test('an empty prerelease channel is reported as no-release, not as a failure', async () => {
+  await withReleaseServer(async ({ base, routes }) => {
+    const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+    const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+    const record = await createEnvironment({ name: 'test', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+    // Only a draft and an unrelated tag: there is no prerelease to install.
+    routes.set('/repos/T-Auto/dsh-dpx/releases', {
+      body: JSON.stringify([{ tag_name: 'desktop-v0.9.0', draft: true }, { tag_name: 'release-notes' }]),
+    });
+    const check = await checkDesktopUpdate({ envRoot: record.root, source: 'github:T-Auto/dsh-dpx', prerelease: true, apiBase: base });
+    assert.equal(check.available, false);
+    assert.equal(check.reason, 'no-release');
+    // The same situation fails loudly when the caller asks for the manifest
+    // itself, because there is no manifest to resolve.
+    await assert.rejects(
+      fetchDesktopRelease('github:T-Auto/dsh-dpx', { prerelease: true, apiBase: base }),
+      error => error.status === 404,
+    );
+  });
+});
+
 test('dpx desktop install is the explicit door, while update refuses a downgrade', async () => {
   await withReleaseServer(async ({ base, routes, asset }) => {
     const work = await mkdtemp(join(tmpdir(), 'dpx-cli-'));
