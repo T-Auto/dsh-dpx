@@ -150,11 +150,15 @@ function Invoke-Gh {
   for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { & gh @Arguments 2>&1 | ForEach-Object { Write-Host $_ } } finally { $ErrorActionPreference = $previous }
+    try { $output = & gh @Arguments 2>&1 } finally { $ErrorActionPreference = $previous }
+    $output | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -eq 0) { return }
     $code = $LASTEXITCODE
+    # gh's own words go into the failure: a step that dies inside a script shows
+    # only "exit code 1" in the checks UI, and the reason has to travel with it.
+    $detail = (@($output | Select-Object -Last 6) -join ' | ')
     if ($attempt -eq $Attempts) {
-      throw "$Action 失败（gh 退出码 $code，已尝试 $Attempts 次）。下一步：先只读核对远端状态 gh release view $script:tag --repo $Repository --json isDraft,assets；若已有 draft 就直接重跑 -Upload（会补齐缺失资产），若已发布则不要再动它，改为升版本号。"
+      throw "$Action 失败（gh 退出码 $code，已尝试 $Attempts 次）：$detail。下一步：先只读核对远端状态 gh release view $script:tag --repo $Repository --json isDraft,assets；若已有 draft 就直接重跑 -Upload（会补齐缺失资产），若已发布则不要再动它，改为升版本号。"
     }
     Write-Warning "$Action 第 $attempt 次失败（gh 退出码 $code），$($attempt * 3) 秒后重试。"
     Start-Sleep -Seconds ($attempt * 3)
@@ -189,8 +193,20 @@ if ($Publish) {
   }
 }
 
-gh auth status | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'gh 未登录。在 CI 里把 github.token 作为 GH_TOKEN 传给这一步；在本地先跑 gh auth login（本脚本从不替你登录）。' }
+# Read the auth state with stderr merged and under `Continue`. `gh` reports its
+# credential source on stderr ("The value of the GH_TOKEN environment variable is
+# being used for authentication"), and this script runs under
+# `$ErrorActionPreference = 'Stop'`, where a native command's stderr is not
+# something to ignore. The check stays a gate, but it no longer decides the run by
+# side effect - the working release flow before it simply called gh and looked at
+# the exit code.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $auth = & gh auth status 2>&1 } finally { $ErrorActionPreference = $previous }
+if ($LASTEXITCODE -ne 0) {
+  throw "gh 未登录（$($auth -join ' ')）。在 CI 里把 github.token 作为 GH_TOKEN 传给这一步；在本地先跑 gh auth login（本脚本从不替你登录）。"
+}
+$auth | ForEach-Object { Write-Host $_ }
 
 if ($Upload) {
   $state = Get-ReleaseState -Tag $tag -Repo $Repository

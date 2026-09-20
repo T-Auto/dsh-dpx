@@ -206,11 +206,26 @@ jobs:
             `dpx desktop update --<environment>`.
         shell: pwsh
         run: |
+          # Diagnostics first. `gh`'s view of its own credential and the version the
+          # runner ships belong in the annotations, next to any failure: a step that
+          # dies inside a script otherwise shows only "exit code 1" in the checks UI.
+          $previous = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            Write-Host "::notice title=gh version::$((gh --version) -join ' ')"
+            $auth = gh auth status 2>&1
+            $auth | ForEach-Object { Write-Host $_ }
+          } finally { $ErrorActionPreference = $previous }
           $arguments = @('-Directory', 'dist', '-Upload')
           $key = 'assets/windows/desktop-release-pub.txt'
           if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
           else { Write-Host "::notice title=Unsigned release::No packaged public key at $key, so no signature is required." }
-          ./scripts/publish-desktop-release.ps1 @arguments -Notes $env:DPX_RELEASE_NOTES
+          try {
+            ./scripts/publish-desktop-release.ps1 @arguments -Notes $env:DPX_RELEASE_NOTES
+          } catch {
+            Write-Host "::error title=Desktop release upload failed::$($_.Exception.Message)"
+            throw
+          }
 
       - name: Verify the draft and publish it
         env:
@@ -221,4 +236,9 @@ jobs:
           $arguments = @('-Directory', 'dist', '-Publish')
           $key = 'assets/windows/desktop-release-pub.txt'
           if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
-          ./scripts/publish-desktop-release.ps1 @arguments
+          try {
+            ./scripts/publish-desktop-release.ps1 @arguments
+          } catch {
+            Write-Host "::error title=Desktop release publish failed::$($_.Exception.Message)"
+            throw
+          }
