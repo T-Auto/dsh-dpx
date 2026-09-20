@@ -867,7 +867,9 @@ export async function updateDesktopLauncher({
   await mkdir(dirname(target), { recursive: true });
   try {
     await writeFile(staged, buffer);
-    await rm(target, { force: true });
+    // Rename onto the launcher instead of deleting it first: `rename` replaces an
+    // existing file on Windows as well, so there is never a moment without an EXE
+    // and never a state where a crash would leave the environment launcher-less.
     await rename(staged, target);
   } catch (error) {
     await rm(staged, { force: true });
@@ -893,8 +895,21 @@ export async function installBundledDesktopLauncher({ envRoot, artifactPath, art
   const root = resolve(envRoot);
   const buffer = artifactBuffer ?? await readFile(artifactPath);
   const target = desktopLauncherPath(root);
+  const staged = `${target}.${process.pid}.new`;
   await mkdir(dirname(target), { recursive: true });
-  await writeFile(target, buffer);
+  // Stage and rename, exactly like the update path: the existing launcher is
+  // never truncated in place, and a launcher that is currently running is
+  // reported as "close it first" instead of as a raw EBUSY from the filesystem.
+  try {
+    await writeFile(staged, buffer);
+    await rename(staged, target);
+  } catch (error) {
+    await rm(staged, { force: true });
+    if (error?.code === 'EPERM' || error?.code === 'EBUSY') {
+      throw new Error(`无法替换正在运行的桌面启动器：${target}。请先关闭该桌面程序后重试。`);
+    }
+    throw error;
+  }
   const manifest = await readBundledDesktopManifest();
   const sha256 = sha256Of(buffer);
   await writeDesktopStamp(root, {

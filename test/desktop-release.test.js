@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
@@ -224,6 +224,31 @@ test('checking and installing a release verifies the digest and records a stamp'
   });
 });
 
+test('upgrading replaces the installed launcher in one step and leaves nothing staged', async () => {
+  await withReleaseServer(async ({ base, routes, asset }) => {
+    const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+    const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+    const record = await createEnvironment({ name: 'test', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+    const envRoot = record.root;
+    const older = Buffer.from('launcher bytes of the installed version');
+    routes.set('/old.json', { body: JSON.stringify(manifest('0.2.1', { bytes: older, assetUrl: 'old.exe' })) });
+    routes.set('/old.exe', { type: 'application/octet-stream', body: older });
+    routes.set('/new.json', { body: JSON.stringify(manifest('0.2.2', { bytes: asset, assetUrl: 'new.exe' })) });
+    routes.set('/new.exe', { type: 'application/octet-stream', body: asset });
+
+    await updateDesktopLauncher({ envRoot, source: `${base}/old.json` });
+    assert.deepEqual(await readFile(desktopLauncherPath(envRoot)), older);
+
+    const upgraded = await updateDesktopLauncher({ envRoot, source: `${base}/new.json` });
+    assert.equal(upgraded.updated, true);
+    assert.deepEqual(await readFile(desktopLauncherPath(envRoot)), asset);
+    // The replacement lands by rename, so the staged copy is gone: there is no
+    // window in which the environment has no EXE, and no leftover to confuse the
+    // next install.
+    assert.deepEqual(readdirSync(dirname(desktopLauncherPath(envRoot))).filter(name => name.endsWith('.new')), []);
+  });
+});
+
 test('a tampered asset is rejected and never installed', async () => {
   await withReleaseServer(async ({ base, routes, asset }) => {
     const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
@@ -284,6 +309,23 @@ test('the bundled launcher is installed with a digest stamp', async () => {
   assert.equal(stamp.source, 'bundled');
   assert.equal(stamp.sha256, sha256(bytes));
   assert.deepEqual(await readFile(pathsFor(record.root).desktop), bytes);
+});
+
+test('reinstalling the bundled launcher replaces it in one step and leaves nothing staged', async () => {
+  const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+  const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+  const record = await createEnvironment({ name: 'test', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+  const first = Buffer.from('bundled launcher, first build');
+  const second = Buffer.from('bundled launcher, rebuilt');
+  await installBundledDesktopLauncher({ envRoot: record.root, artifactBuffer: first });
+  assert.deepEqual(await readFile(desktopLauncherPath(record.root)), first);
+
+  // Re-running `env create` (or a reinstall) must overwrite the launcher without
+  // a moment in which it is truncated, and without leaving the staged copy.
+  const again = await installBundledDesktopLauncher({ envRoot: record.root, artifactBuffer: second });
+  assert.equal(again.sha256, sha256(second));
+  assert.deepEqual(await readFile(desktopLauncherPath(record.root)), second);
+  assert.deepEqual(readdirSync(dirname(desktopLauncherPath(record.root))).filter(name => name.endsWith('.new')), []);
 });
 
 test('dpx desktop status/check/update drive the release channel from the cli', async () => {
