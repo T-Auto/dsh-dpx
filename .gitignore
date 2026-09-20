@@ -20,3 +20,7 @@ backup
 test/*/
 
 .workspace/
+
+# Local convenience launcher for this checkout (double-click to start an agent
+# here). It belongs to the machine, not to the project.
+/run-pi-here.bat
