@@ -77,9 +77,7 @@ pub struct Settings {
     pub tray_enabled: bool,
     pub update_source: Option<String>,
     pub update_proxy: Option<String>,
-    pub auto_check_updates: bool,
     pub last_check: Option<LastCheck>,
-    pub dsh_package: Option<String>,
 }
 
 impl Default for Settings {
@@ -90,9 +88,7 @@ impl Default for Settings {
             tray_enabled: true,
             update_source: None,
             update_proxy: None,
-            auto_check_updates: false,
             last_check: None,
-            dsh_package: None,
         }
     }
 }
@@ -139,14 +135,21 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.close_action, CloseAction::Ask);
         assert!(settings.tray_enabled);
-        assert!(!settings.auto_check_updates);
+        assert!(settings.last_check.is_none());
     }
 
+    /// A settings file written by an older shell keeps loading: the shell never
+    /// fails to start because it meets a key it no longer uses.
     #[test]
     fn unknown_or_missing_keys_fall_back_to_defaults() {
         let parsed: Settings = serde_json::from_str(r#"{"closeAction":"tray","futureKey":42}"#).unwrap();
         assert_eq!(parsed.close_action, CloseAction::Tray);
         assert!(parsed.tray_enabled);
+
+        let legacy: Settings =
+            serde_json::from_str(r#"{"autoCheckUpdates":true,"dshPackage":"@deepseek-ai/dsh"}"#).unwrap();
+        assert_eq!(legacy.close_action, CloseAction::Ask);
+        assert!(legacy.update_source.is_none());
     }
 
     #[test]

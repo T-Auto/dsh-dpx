@@ -63,6 +63,17 @@
       const invoke = window.__TAURI__.core.invoke;
       const $ = id => document.getElementById(id);
       let settings = null;
+      // The shell refuses two things without an explicit acknowledgement: a
+      // republished build of the version that is already installed (same version,
+      // different bytes) and replacing the launcher while this environment's DSH
+      // is still running. Each is a click-again confirmation, never a dead end,
+      // and both are cleared whenever a new check runs.
+      let forceAcknowledged = false;
+      let runningAcknowledged = false;
+
+      function needsForce(check) {
+        return Boolean(check?.available) && check?.reason === 'different-build';
+      }
 
       function showStatus(element, message, kind) {
         element.textContent = message;
@@ -104,7 +115,10 @@
         $('log-hint').textContent = `日志：${info.logPath}`;
         syncForm();
         showStatus($('update-status'), describeCheck(settings.lastCheck), settings.lastCheck?.available ? 'ok' : '');
+        forceAcknowledged = false;
+        runningAcknowledged = false;
         $('apply-update').disabled = !settings.lastCheck?.available;
+        $('apply-update').textContent = needsForce(settings.lastCheck) ? '强制更新' : '立即更新';
       }
 
       async function patch(body, note) {
@@ -127,8 +141,11 @@
         try {
           const result = await invoke('check_desktop_update');
           settings.lastCheck = result;
+          forceAcknowledged = false;
+          runningAcknowledged = false;
           showStatus($('update-status'), describeCheck(result), result.available ? 'ok' : '');
           $('apply-update').disabled = !result.available;
+          $('apply-update').textContent = needsForce(result) ? '强制更新' : '立即更新';
         } catch (error) {
           showStatus($('update-status'), String(error), 'error');
         } finally {
@@ -137,13 +154,25 @@
       });
 
       $('apply-update').addEventListener('click', async () => {
+        const force = needsForce(settings?.lastCheck);
+        if (force && !forceAcknowledged) {
+          forceAcknowledged = true;
+          showStatus($('update-status'), '发布源与本地同版本但字节不同（该版本被重新构建过）。再次点击“强制更新”才会覆盖安装。', 'error');
+          return;
+        }
         $('apply-update').disabled = true;
         showStatus($('update-status'), '正在下载并校验新版本…程序会自动重启。');
         try {
-          const result = await invoke('apply_desktop_update');
+          const result = await invoke('apply_desktop_update', { force, confirmRunning: runningAcknowledged });
           showStatus($('update-status'), `已更新到 ${result.version}${result.restart ? '，正在重启…' : ''}`, 'ok');
         } catch (error) {
-          showStatus($('update-status'), String(error), 'error');
+          const text = String(error);
+          if (!runningAcknowledged && text.includes('仍在运行')) {
+            runningAcknowledged = true;
+            showStatus($('update-status'), `${text}\n\n确认要继续请再次点击“强制更新”或“立即更新”。`, 'error');
+          } else {
+            showStatus($('update-status'), text, 'error');
+          }
           $('apply-update').disabled = false;
         }
       });
