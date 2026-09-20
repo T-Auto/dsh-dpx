@@ -144,30 +144,55 @@ pub fn focus_existing(record: &InstanceRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{acquire, focus_existing, publish, read_record, withdraw, Instance, InstanceRecord};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// A scratch environment root that removes itself.
+    ///
+    /// `acquire` writes a lock and a record below the root, and the tests used to
+    /// leave all three of them in the machine's temp directory on every run - a
+    /// `cargo test` loop accumulated thousands. Dropping the guard cleans up, and
+    /// because it is a `Drop` impl it also runs when an assertion panics.
+    struct ScratchRoot(PathBuf);
+
+    impl ScratchRoot {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("dpx-instance-{tag}-{}", std::process::id())))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            // Best effort: a handle Windows still holds must not fail a test.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn the_guard_is_scoped_to_one_environment() {
-        let first = std::env::temp_dir().join(format!("dpx-instance-a-{}", std::process::id()));
-        let second = std::env::temp_dir().join(format!("dpx-instance-b-{}", std::process::id()));
-        let a = acquire(&first).expect("first environment");
-        let b = acquire(&second).expect("second environment");
+        let first = ScratchRoot::new("a");
+        let second = ScratchRoot::new("b");
+        let a = acquire(first.path()).expect("first environment");
+        let b = acquire(second.path()).expect("second environment");
         assert!(matches!(a, Instance::Primary(_)));
         assert!(matches!(b, Instance::Primary(_)), "a second environment must not be blocked");
     }
 
     #[test]
     fn a_second_launch_of_the_same_environment_is_reported() {
-        let root = std::env::temp_dir().join(format!("dpx-instance-same-{}", std::process::id()));
-        let first = acquire(&root).expect("first");
+        let root = ScratchRoot::new("same");
+        let first = acquire(root.path()).expect("first");
         assert!(matches!(first, Instance::Primary(_)));
         // The lock is held by this process, and Windows only denies the second
         // open across processes, so assert the plumbing instead of the denial.
-        publish(&root, 1234);
-        let record = read_record(&root).expect("record");
+        publish(root.path(), 1234);
+        let record = read_record(root.path()).expect("record");
         assert_eq!(record.hwnd, 1234);
-        withdraw(&root);
-        assert!(read_record(&root).is_none());
+        withdraw(root.path());
+        assert!(read_record(root.path()).is_none());
     }
 
     #[test]
