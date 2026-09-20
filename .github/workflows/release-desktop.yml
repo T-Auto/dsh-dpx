@@ -194,6 +194,12 @@ jobs:
       # Until then a notice is emitted and nothing is required.
       - name: Upload the release assets as a draft
         env:
+          # `gh` reads its credential from the environment, and `github.token` is
+          # not exported on its own: without this the script's own
+          # `gh auth status` check fails with "not logged into any GitHub hosts"
+          # and no release is ever created. `contents: write` above is what makes
+          # this token able to create one.
+          GH_TOKEN: ${{ github.token }}
           DPX_RELEASE_NOTES: >-
             dsh-dpx desktop launcher ${{ steps.version.outputs.version }}.
             Update from the tray icon -> 设置 -> 检查更新, or run
@@ -207,6 +213,9 @@ jobs:
           ./scripts/publish-desktop-release.ps1 @arguments -Notes $env:DPX_RELEASE_NOTES
 
       - name: Verify the draft and publish it
+        env:
+          # Same reason as the upload step: `gh` needs the token in the environment.
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $arguments = @('-Directory', 'dist', '-Publish')

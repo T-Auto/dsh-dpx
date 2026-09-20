@@ -190,7 +190,7 @@ if ($Publish) {
 }
 
 gh auth status | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'gh 未登录；先跑 gh auth login（本脚本从不替你登录）。' }
+if ($LASTEXITCODE -ne 0) { throw 'gh 未登录。在 CI 里把 github.token 作为 GH_TOKEN 传给这一步；在本地先跑 gh auth login（本脚本从不替你登录）。' }
 
 if ($Upload) {
   $state = Get-ReleaseState -Tag $tag -Repo $Repository
