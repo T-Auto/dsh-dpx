@@ -255,21 +255,37 @@ dpx desktop update --test --source https://example.com/desktop-latest.json # 自
 dpx desktop update --test --source .\dist\desktop-latest.json              # 本地清单
 ```
 
-下载内容必须通过清单里的 `size` 与 `sha256` 校验才会被安装；校验失败会拒绝安装并保留原启动器。需要代理时用 `--proxy`，或依赖环境里的 `HTTPS_PROXY` / `ALL_PROXY`（桌面端还会读取 Windows 系统代理）。
+下载内容必须通过清单里的 `size` 与 `sha256` 校验才会被安装；校验失败会拒绝安装并保留原启动器。需要代理时用 `--proxy`，或依赖环境里的 `HTTPS_PROXY` / `ALL_PROXY`；桌面端只在显式配置了 `updateProxy` 设置或 `DPX_HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `DEFAULT_PROXY` 环境变量时才走代理（`Cargo.toml` 虽为 `ureq` 启用了 `win-system-proxy` feature，但 `update.rs` 没有调用系统代理 API，因此是否默认读取 Windows 系统代理**未经验证**）。
+
+发布清单可以带一个可选的 `sig`（Ed25519，签的是产物摘要而不是清单字节）。默认不校验，行为与现在完全一致；配置了受信公钥（`DPX_DESKTOP_PUBLIC_KEY` / `DPX_DESKTOP_PUBLIC_KEYS`）之后转为严格模式：签名不符、或清单没有 `sig`，都会被拒绝安装。公钥随 npm 包内的 `assets/windows/` 分发，私钥不参与构建与发布，详见 [`docs/desktop-release.md`](docs/desktop-release.md)。
 
 环境描述符将 `./desktop` 声明为 DPX 专属桌面启动器目录（公共协议的受限相对路径语法不允许以含空格的 EXE 文件名作为资源位置）。
 
-源码中保留了透明、可复现的 Tauri 构建目录 `desktop-shell/`。发布包包含预构建 x64 EXE，因此普通 dpx 用户无需安装 Rust/Tauri；维护者需要重建时运行：
+源码中保留了透明、可复现的 Tauri 构建目录 `desktop-shell/`。发布包包含预构建 x64 EXE，因此普通 dpx 用户无需安装 Rust/Tauri；维护者发布新版本时按下面的顺序操作：
 
 ```powershell
-# 重建内置产物 assets\windows\DSH DeepSeek Harness Desktop.exe 与 desktop-manifest.json
-npm run desktop:build
+# 1. 重建内置产物 assets\windows\* 与发布目录 dist（一次构建同时写出两份，字节相同）
+npm run desktop:release
 
-# 额外产出可发布的 Release 目录（版本化 EXE + desktop-latest.json）
-powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1 -Version 0.2.1 -OutputDirectory dist -SkipPackagedArtifact
+# 2. 提交刷新后的 assets\windows\*，再打 tag —— CI 会拒绝"包内清单版本与 tag 不符"的发布
+git add assets/windows; git commit -m "chore(desktop): rebuild the packaged launcher"
+
+# 3. 生成 SBOM（CI 也会做；本地只为核对）
+npm run desktop:sbom
+
+# 4. 两步发布：先 draft + 回执，核对远端摘要后再转正式
+npm run desktop:upload
+npm run desktop:publish
 ```
 
-该脚本会话级启用本机 `D:\DevEnvs\Rust` 工具链（若存在），下载走 `-Proxy` / `DPX_BUILD_PROXY`；版本号同时写入编译期常量（`DPX_DESKTOP_VERSION`），所以启动器总能报告自己的真实版本。图标来源为 `whale-app-icon.ico`，会在构建时明确覆盖 Tauri 的 Windows 原生图标资源。
+`npm run desktop:build` 是不带 `-OutputDirectory` 的同一路径，只刷新 `assets\windows\*`。
+一次构建同时写出两份产物（包内 `assets\windows\*` 与发布目录 `dist`），因此它们的字节相同；`-SkipPackagedArtifact` 会破坏这一点，发布脚本会直接拒绝与包内清单摘要/版本不一致的目录，CI 也会断言两份清单指向同一 sha256。
+CI 不能提交文件，所以它另加了一道**版本门禁**：tag 的版本必须与已提交的 `assets\windows\desktop-manifest.json` 版本一致，否则拒绝发布——`dpx desktop install` 读的正是 npm 包里的这份包内清单，这道门禁把"人工忘记重建、包内仍是旧版本"从静默装上旧二进制变成硬失败。
+仍未闭合的残余：CI 是重新编译，而重新编译不保证逐字节可复现，所以同一版本下 npm 包里的 EXE 与 Release 里的 EXE 理论上仍可能不同字节；这时 CI 只发 `::warning` 提示"重建并提交 `assets/windows\*`"，不 fail（不可复现的差异不能当门禁）。
+旧的无引用脚本 `scripts\pack-desktop-release.ps1` 已删除：它的"只拷贝不重建"会重新引入第二份载荷来源，与上面"一次构建写出两份"的收敛目标冲突。
+CI 不持有签名私钥：签名是离线步骤，公开的部分只有公钥（见上文）。
+
+该脚本会从 `desktop-shell\src-tauri\rust-toolchain.toml` 读取 Rust 工具链（不再用会话级 `RUSTUP_TOOLCHAIN` 覆盖它），并把 `--locked` 透传给 cargo，使构建在 `Cargo.lock` 过期时失败而不是静默升级依赖。它还会在存在时启用本机 `D:\DevEnvs\Rust` 工具链，下载走 `-Proxy` / `DPX_BUILD_PROXY`；版本号同时写入编译期常量（`DPX_DESKTOP_VERSION`），所以启动器总能报告自己的真实版本。图标来源为 `whale-app-icon.ico`，会在构建时明确覆盖 Tauri 的 Windows 原生图标资源。
 
 ## 启动隔离环境
 

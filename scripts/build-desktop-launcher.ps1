@@ -5,6 +5,9 @@ param(
   # Also write a publishable release folder (versioned EXE + desktop-latest.json).
   [string]$OutputDirectory,
   # Skip refreshing `assets\windows`, useful when building an older demo artifact.
+  # Never use this for a release: the packaged manifest is what `dpx desktop
+  # install` copies out of the npm package, and `publish-desktop-release.ps1`
+  # refuses to publish a folder that does not match it.
   [switch]$SkipPackagedArtifact,
   # HTTP(S) proxy for cargo/npm downloads. Defaults to $env:DPX_BUILD_PROXY.
   [string]$Proxy = $env:DPX_BUILD_PROXY
@@ -50,8 +53,21 @@ $localRust = 'D:\DevEnvs\Rust'
 if (Test-Path (Join-Path $localRust '.rustup')) {
   $env:CARGO_HOME = Join-Path $localRust '.cargo'
   $env:RUSTUP_HOME = Join-Path $localRust '.rustup'
-  $env:RUSTUP_TOOLCHAIN = 'stable-x86_64-pc-windows-msvc'
   $env:Path = "$(Join-Path $localRust '.cargo\bin');$env:Path"
+}
+
+# `RUSTUP_TOOLCHAIN` wins over `rust-toolchain.toml`, so setting a channel here by
+# hand would silently make that file decorative. Read the pin instead, and leave
+# the environment untouched when there is no file to read.
+$toolchainFile = Join-Path $shell 'src-tauri\rust-toolchain.toml'
+if (Test-Path $toolchainFile) {
+  $channel = Select-String -Path $toolchainFile -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+  if ($channel) {
+    $env:RUSTUP_TOOLCHAIN = $channel.Matches[0].Groups[1].Value
+    Write-Host "Rust toolchain pinned by rust-toolchain.toml: $env:RUSTUP_TOOLCHAIN"
+  } else {
+    Write-Warning "$toolchainFile has no [toolchain] channel; leaving RUSTUP_TOOLCHAIN unset."
+  }
 }
 if ($Proxy) {
   $env:HTTP_PROXY = $Proxy

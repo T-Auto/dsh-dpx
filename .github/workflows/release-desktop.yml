@@ -5,7 +5,24 @@ name: Release desktop launcher
 #
 #   tag:    desktop-v<version>
 #   assets: DSH-DeepSeek-Harness-Desktop-<version>-x64.exe
-#           desktop-latest.json      (manifest consumed by dpx and the shell)
+#           desktop-latest.json                  (manifest consumed by dpx and the shell)
+#           desktop-<version>.spdx.json          (SBOM, generated below)
+#
+# The launcher is compiled from the tagged source, and the same build also
+# refreshes the git-tracked `assets/windows/*` copy that ships inside the npm
+# package, so the published release and the packaged launcher cannot drift apart
+# within one run. `Verify the packaged launcher is current` refuses a tag whose
+# committed packaged artifact was never refreshed, because CI cannot commit:
+# without that gate an operator could tag a new version while npm consumers keep
+# installing the previous binary, and `dpx desktop install` would report success.
+#
+# Publication is two auditable steps: `upload` creates a DRAFT release and writes
+# a receipt next to the assets, `publish` re-reads that receipt, re-verifies every
+# remote asset digest through the GitHub API, and only then flips the draft live.
+# A draft is NOT a publication - `gh release view` sees drafts too, so the
+# immutability gate below tests `isDraft` instead of testing tag existence. This
+# is the order `gh release create --help` documents: create the release as a
+# draft, upload the assets, then publish the release.
 
 on:
   push:
@@ -21,16 +38,38 @@ permissions:
   contents: write
 
 jobs:
+  # Feasibility probe, not a gate. Github's windows-latest image is not documented
+  # to provide an interactive desktop session, and
+  # `scripts/verify-desktop-shell-window.ps1` deliberately refuses the framework
+  # `MainWindowHandle` fallback, so whether that acceptance script can ever run in
+  # CI is unproven. Report what the runner has and never fail the pipeline.
+  probe:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Probe for an interactive desktop
+        shell: pwsh
+        run: |
+          $webview = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv
+          $notepad = Start-Process notepad -PassThru; Start-Sleep -Seconds 2; $notepad.Refresh()
+          $handle = $notepad.MainWindowHandle; Stop-Process -Id $notepad.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "::notice title=Desktop probe::UserInteractive=$([Environment]::UserInteractive) WebView2=$webview NotepadMainWindow=$handle"
+
   build:
     runs-on: windows-latest
+    # `id-token` and `attestations` are required by the build-provenance
+    # attestation step; they are scoped to this job instead of granted
+    # workflow-wide, so the probe job cannot request an OIDC token.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - name: Resolve the desktop version
         id: version
@@ -44,12 +83,37 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+') { throw "Invalid desktop version: $version" }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Install the Tauri build dependencies
-        working-directory: desktop-shell
-        run: npm ci
+      # The dsh-dpx package itself has no lockfile and no dependencies, so the
+      # suite runs without an install step. `npm ci` would fail on this tree.
+      - name: Test the CLI (npm test)
+        shell: pwsh
+        run: npm test
+
+      # The gate that protects npm consumers. `assets/windows/*` is git-tracked,
+      # is listed in the package `files`, and is what `dpx desktop install` copies;
+      # CI can rebuild it but cannot commit it. Refuse to release a version whose
+      # committed packaged launcher was never refreshed, instead of publishing a
+      # Release whose bytes differ from the packaged ones.
+      - name: Verify the packaged launcher is current
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $packaged = Get-Content assets/windows/desktop-manifest.json -Raw | ConvertFrom-Json
+          if ($packaged.version -ne $version) {
+            throw "assets/windows/desktop-manifest.json is v$($packaged.version), not v$version. Run ``npm run desktop:build``, commit assets/windows/, then re-tag."
+          }
+
+      # The toolchain is whatever desktop-shell/src-tauri/rust-toolchain.toml pins;
+      # rustup installs a missing channel on first use. No third-party action picks
+      # the compiler, and nothing here can override the pin file.
+      - name: Install the pinned Rust toolchain
+        working-directory: desktop-shell/src-tauri
+        run: |
+          rustup show
+          rustc --version
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -57,51 +121,95 @@ jobs:
             desktop-shell/src-tauri/target
           key: ${{ runner.os }}-desktop-${{ hashFiles('desktop-shell/src-tauri/Cargo.lock') }}
 
+      # Sharing this job with the build keeps one toolchain setup instead of two.
+      # cargo test links the real Tauri stack, so it needs a Windows runner: the
+      # Linux build of tauri 2 needs GTK/WebKitGTK, which the image lacks.
+      - name: Test the desktop shell (cargo test)
+        working-directory: desktop-shell/src-tauri
+        run: cargo test --locked
+
+      - name: Install the Tauri build dependencies
+        working-directory: desktop-shell
+        run: npm ci
+
+      # One build writes both payloads: the git-tracked `assets\windows\*` copy and
+      # the publishable folder, from identical bytes. `-SkipPackagedArtifact` is
+      # never used here - it is what let the packaged manifest and the release
+      # manifest drift apart.
       - name: Build the launcher and its release manifest
         shell: pwsh
         run: >
           ./scripts/build-desktop-launcher.ps1
           -Version '${{ steps.version.outputs.version }}'
-          -SkipPackagedArtifact
           -OutputDirectory dist
 
-      - name: Smoke-test the packaged manifest
+      # Diagnostics, not a gate. Even from one tag, a rebuild is not byte
+      # reproducible in general (the compiler version, paths and PE timestamps can
+      # differ), so this difference cannot fail the release. It still tells the
+      # operator that the launcher committed for npm consumers has the older bytes.
+      - name: Report a diverged packaged launcher
         shell: pwsh
         run: |
-          $manifest = Get-Content dist/desktop-latest.json -Raw | ConvertFrom-Json
-          $asset = Join-Path dist $manifest.assetName
-          if (-not (Test-Path $asset)) { throw "Missing release asset: $asset" }
-          $digest = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($digest -ne $manifest.sha256) { throw "Digest mismatch: $digest != $($manifest.sha256)" }
-          if ((Get-Item $asset).Length -ne $manifest.size) { throw 'Size mismatch' }
-
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = '${{ steps.version.outputs.version }}'
-          $tag = "desktop-v$version"
-          $repository = '${{ github.repository }}'
-          $manifest = Get-Content dist/desktop-latest.json -Raw | ConvertFrom-Json
-          $assets = @((Join-Path dist $manifest.assetName), (Join-Path 'dist' 'desktop-latest.json'))
-
-          # Published artifacts are immutable. If the tag already has a release -
-          # created by hand from a locally verified build, or by an earlier run of
-          # this workflow - leave it alone and report it, instead of silently
-          # replacing bytes people may already have downloaded. Bump the desktop
-          # version to publish something new.
-          gh release view $tag --repo $repository *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "::notice title=Already published::$tag already exists; its assets were left untouched."
-            gh release view $tag --repo $repository --json assets --jq '.assets[] | "  \(.name)  \(.digest)"'
-            gh release view $tag --repo $repository --json url --jq '.url'
-            exit 0
+          $changed = git status --porcelain -- 'assets/windows/*.exe'
+          if ($changed) {
+            Write-Host "::warning title=Packaged launcher diverges::The rebuilt launcher differs from the committed assets/windows/*.exe. Run ``npm run desktop:build`` and commit it, so npm consumers get the released bytes."
           }
 
-          gh release create $tag @assets --repo $repository `
-            --title "Desktop launcher $version" `
-            --notes "dsh-dpx desktop launcher $version. Update from the tray icon -> 设置 -> 检查更新, or run ``dpx desktop update --<environment>``."
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
-          Write-Host "Published $tag"
+      - name: Verify the two manifests describe the same bytes
+        shell: pwsh
+        run: |
+          $packaged = Get-Content assets/windows/desktop-manifest.json -Raw | ConvertFrom-Json
+          $release = Get-Content dist/desktop-latest.json -Raw | ConvertFrom-Json
+          if ($packaged.sha256 -ne $release.sha256) { throw "Manifest drift: packaged=$($packaged.sha256) release=$($release.sha256)" }
+          if ($packaged.version -ne $release.version) { throw "Version drift: packaged=$($packaged.version) release=$($release.version)" }
+          $asset = Join-Path dist $release.assetName
+          if (-not (Test-Path $asset)) { throw "Missing release asset: $asset" }
+          $digest = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne $release.sha256) { throw "Digest mismatch: $digest != $($release.sha256)" }
+          if ((Get-Item $asset).Length -ne $release.size) { throw 'Size mismatch' }
+
+      # The SBOM has to be generated before the upload step: a release's assets are
+      # immutable once it is published, so an asset that is not in this run's asset
+      # list can never be added later.
+      - name: Generate the SBOM
+        shell: pwsh
+        run: >
+          ./scripts/generate-desktop-sbom.ps1
+          -ReleaseDirectory dist
+          -Version '${{ steps.version.outputs.version }}'
+
+      # Provenance for the exact bytes that will be published, from the workflow
+      # identity. Fail-closed on purpose: a missing attestation stops the release
+      # while the draft is still invisible.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/DSH-DeepSeek-Harness-Desktop-*-x64.exe
+            dist/desktop-latest.json
+            dist/desktop-*.spdx.json
+
+      # Signature enforcement follows key distribution: as soon as the public key is
+      # committed, every release must carry a `sig` that verifies against it.
+      # Until then a notice is emitted and nothing is required.
+      - name: Upload the release assets as a draft
+        env:
+          DPX_RELEASE_NOTES: >-
+            dsh-dpx desktop launcher ${{ steps.version.outputs.version }}.
+            Update from the tray icon -> 设置 -> 检查更新, or run
+            `dpx desktop update --<environment>`.
+        shell: pwsh
+        run: |
+          $arguments = @('-Directory', 'dist', '-Upload')
+          $key = 'assets/windows/desktop-release-pub.txt'
+          if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
+          else { Write-Host "::notice title=Unsigned release::No packaged public key at $key, so no signature is required." }
+          ./scripts/publish-desktop-release.ps1 @arguments -Notes $env:DPX_RELEASE_NOTES
+
+      - name: Verify the draft and publish it
+        shell: pwsh
+        run: |
+          $arguments = @('-Directory', 'dist', '-Publish')
+          $key = 'assets/windows/desktop-release-pub.txt'
+          if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
+          ./scripts/publish-desktop-release.ps1 @arguments

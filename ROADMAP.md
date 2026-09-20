@@ -157,7 +157,17 @@ Release 分发，契约见 [`docs/desktop-release.md`](docs/desktop-release.md)�
 
 ### 实现结果
 
-- 发布 tag 为 `desktop-v<version>`，资产为版本化 EXE 与 `desktop-latest.json` 清单；
+- 发布 tag 为 `desktop-v<version>`，资产为版本化 EXE、`desktop-latest.json` 清单与
+  `desktop-<version>.spdx.json`（SPDX 2.3 SBOM，内容为已发布文件的 sha256 清单 +
+  `Cargo.lock` / `package-lock.json` 的锁定依赖集）；
+- 发布不可覆盖：`release-desktop.yml` 对已存在的**已发布** release 原样不动（草稿不算已发布，
+  `gh release view` 同样看得见草稿，因此门禁判的是 `isDraft` 而不是 tag 是否存在）；
+- 发布分两步且可审计：`scripts/publish-desktop-release.ps1 -Upload` 建/补 draft 资产并写
+  `desktop-upload-receipt.json` 回执，`-Publish` 读回执、用 GitHub API 复核远端每个资产的
+  `size`/`state`/`digest`，全部一致才 `gh release edit --draft=false --latest`；
+- CI 在同一个 build job 里跑 `npm test` 与 `cargo test --locked`（后者必须 Windows runner），
+  并用一次构建同时刷新 `assets\windows\*` 与发布目录；tag 的版本与包内
+  `desktop-manifest.json` 不一致时直接拒绝发布，避免 npm 包里那份启动器与 Release 那份分叉；
 - `dpx desktop status|check|update|install` 与桌面端托盘菜单里的“设置 → 检查更新”走同一份清单契约；
 - 下载内容必须通过 `size` 与 `sha256` 校验，校验失败拒绝安装并保留原启动器；
 - 更新时会先重命名正在运行的 EXE（Windows 允许重命名运行中的可执行文件），再放入新文件，并记录 `desktop/.dpx-desktop.json`；
@@ -210,8 +220,8 @@ Release 分发，契约见 [`docs/desktop-release.md`](docs/desktop-release.md)�
   `job` 的创建与赋值路径。
 - 手工/脚本：两个不同环境同时运行互不干扰；同一环境重复启动只还原窗口；
   强杀启动器后 DSH 子进程随之消失。
-- 测试脚本只按**可执行文件路径/命令行**匹配进程，禁止按镜像名匹配
-  （见 `test\smoke-close.ps1` 的 `Stop-Environment`）。
+- 测试脚本只按**进程 ID** 停止进程（启动器 PID + 从 `shell.log` 解析出的 DSH 子进程 PID），
+  禁止按镜像名匹配（见 `scripts\verify-desktop-shell-window.ps1` 的 `Stop-ScratchEnvironment`）。
 
 ---
 
