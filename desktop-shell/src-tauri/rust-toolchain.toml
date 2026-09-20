@@ -1,0 +1,15 @@
+# The toolchain this shell is built and tested with.
+#
+# `Cargo.toml` declares `rust-version = "1.77"`, which is tauri 2.11's own MSRV
+# (`tauri` requires 1.77.2); this file pins the version the build actually runs,
+# because a floating `stable` means the same tag can be built by whatever stable
+# happens to be installed that day.
+#
+# Commands run with this directory as the working directory use this toolchain.
+# Note that a session-level `RUSTUP_TOOLCHAIN` environment variable overrides
+# this file entirely, so `scripts/build-desktop-launcher.ps1` reads the channel
+# out of this file and exports it as `RUSTUP_TOOLCHAIN` before invoking cargo;
+# builds driven by that script therefore honour the same pin.
+# Keep this file ASCII-only: Windows PowerShell 5.1 reads it as ANSI.
+[toolchain]
+channel = "1.97.1"
