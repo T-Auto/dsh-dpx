@@ -16,7 +16,7 @@
       .row { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 25px; }
       .spinner { width: 15px; height: 15px; border: 2px solid #555; border-top-color: var(--white); border-radius: 50%; animation: spin .8s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
-      .status { color: var(--muted); } .status.ready { color: var(--white); } .status.error { color: var(--white); }
+      .status { color: var(--muted); } .status.ready { color: var(--white); } .status.error { color: var(--white); } .status.slow { color: #d8b45a; }
       pre { margin: 22px 0 0; max-height: 240px; overflow: auto; padding: 13px; border: 1px solid var(--line); background: #050505; color: #ddd; text-align: left; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "Cascadia Mono", Consolas, monospace; user-select: text; }
       button { margin-top: 20px; padding: 8px 20px; color: var(--black); background: var(--white); border: 1px solid var(--white); border-radius: 0; font: inherit; cursor: pointer; }
       button:hover { color: var(--white); background: var(--black); }
@@ -47,6 +47,13 @@
         if (value.state === 'error') {
           spinner.hidden = true; status.textContent = '启动失败'; status.className = 'status error';
           log.textContent = value.message || '未知错误'; log.hidden = false; retry.hidden = false; return true;
+        }
+        if (value.state === 'slow') {
+          // Late, not dead: the shell keeps monitoring, so this stays a notice
+          // with the spinner running and polling continues. "重试" is offered as
+          // an escape hatch, not as the only way out.
+          spinner.hidden = false; status.textContent = value.message || 'DSH 仍在启动，请稍候…';
+          status.className = 'status slow'; log.hidden = true; retry.hidden = false; return false;
         }
         return false;
       }

@@ -33,13 +33,31 @@ mod windows;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+/// How long the shell waits for a ready URL before it stops calling the startup
+/// "starting" and starts calling it "slow". The wait itself is not bounded: the
+/// official desktop client deliberately has no startup-timeout heuristic, and a
+/// cold start of a large profile can legitimately take minutes, so passing this
+/// deadline only changes what the window says.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How recent the DSH child's last output must be for a startup that passed
+/// [`STARTUP_TIMEOUT`] to still read as progress rather than as a suspected hang.
+const STARTUP_SILENCE: Duration = Duration::from_secs(60);
+
+/// Size at which `shell.log` is rotated to `shell.log.1`.
+const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Values shorter than this are not used for credential redaction. The name test
+/// matches ordinary variables too (`KEY` is a substring of `KEYBOARD`-ish names),
+/// and replacing a one- or two-character value would garble every log line
+/// without protecting anything real.
+const MIN_SECRET_CHARS: usize = 8;
 
 /// How long the shell waits for a helper process it started (in practice
 /// `taskkill`) before killing the helper and moving on.
@@ -76,6 +94,10 @@ struct Inner {
     status: Status,
     child: Option<Child>,
     log: String,
+    /// When the DSH child last wrote to stdout or stderr. A startup that passed
+    /// [`STARTUP_TIMEOUT`] reports how long ago this was, which is the difference
+    /// between "slow but working" and "silent and probably stuck".
+    last_output_at: Option<Instant>,
     pending_close: bool,
     /// Set once the shutdown teardown has been claimed, so a second close click
     /// (or a second tray "关闭程序") cannot start a competing `taskkill`.
@@ -125,9 +147,28 @@ impl AppState {
 
     fn set_error(&self, message: String) {
         let mut inner = self.lock();
-        if inner.status.state == "starting" {
+        // "slow" is still a startup in flight, so a child that exits after the
+        // startup deadline must be able to turn it into a real error too.
+        if matches!(inner.status.state, "starting" | "slow") {
             inner.status.state = "error";
             inner.status.message = Some(message);
+        }
+    }
+
+    /// The PID of the DSH child this shell started and that is still running.
+    ///
+    /// Only the shell's *own* child is visible here: a DSH started by
+    /// `dpx run --desktop` in the same environment belongs to that process and is
+    /// deliberately not searched for. [`kill_child`] also `take()`s the handle, so
+    /// during a restart window this answers `None` even though a fresh child is
+    /// about to exist — the caller must treat a `None` as "nothing to warn about",
+    /// never as proof that no DSH is running.
+    fn live_child_pid(&self) -> Option<u32> {
+        let mut inner = self.lock();
+        let child = inner.child.as_mut()?;
+        match child.try_wait() {
+            Ok(None) => Some(child.id()),
+            Ok(Some(_)) | Err(_) => None,
         }
     }
 
@@ -294,6 +335,9 @@ pub fn restart_service(app: &AppHandle) {
         let mut inner = state.lock();
         inner.status = Status::default();
         inner.log.clear();
+        // The previous child's output must not make the new startup look like it
+        // is already making progress.
+        inner.last_output_at = None;
         inner.pending_close = false;
     }
     let worker_app = app.clone();
@@ -394,7 +438,6 @@ struct SettingsPatch {
     tray_enabled: Option<bool>,
     update_source: Option<String>,
     update_proxy: Option<String>,
-    auto_check_updates: Option<bool>,
 }
 
 fn trimmed(value: &Option<String>) -> Option<String> {
@@ -417,9 +460,6 @@ fn save_settings(app: tauri::AppHandle, patch: SettingsPatch) -> Result<settings
     }
     if patch.update_proxy.is_some() {
         current.update_proxy = trimmed(&patch.update_proxy);
-    }
-    if let Some(enabled) = patch.auto_check_updates {
-        current.auto_check_updates = enabled;
     }
     settings::save(&root, &current)?;
     tray::sync(&app, current.tray_enabled);
@@ -449,12 +489,37 @@ struct ApplyResult {
     restart: bool,
 }
 
+/// Apply the pending desktop update to this environment.
+///
+/// Two acknowledgements travel with the click: `force` overrides the "same
+/// version, different bytes" refusal inside [`update::apply`], and
+/// `confirm_running` acknowledges that this environment's DSH is still running.
+/// Neither is a lock — both exist so the settings window can show what is about
+/// to happen and let the operator decide. The running-DSH probe only knows about
+/// the child *this* shell started; a DSH launched by `dpx run --desktop` is not
+/// visible to it (see [`AppState::live_child_pid`]).
 #[tauri::command]
-async fn apply_desktop_update(app: tauri::AppHandle) -> Result<ApplyResult, String> {
+async fn apply_desktop_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    force: Option<bool>,
+    confirm_running: Option<bool>,
+) -> Result<ApplyResult, String> {
+    let force = force.unwrap_or(false);
+    if !confirm_running.unwrap_or(false) {
+        if let Some(pid) = state.live_child_pid() {
+            if let Ok(root) = env_root() {
+                log_line(&root, &format!("desktop update preflight: DSH is still running (pid {pid}); waiting for confirmation"));
+            }
+            return Err(format!(
+                "该环境内的 DSH 仍在运行（pid {pid}）。更新会替换启动器并重启桌面外壳，正在运行的这个 DSH 会被终止。\n\n确认要继续请再次点击“立即更新”。"
+            ));
+        }
+    }
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let root = env_root()?;
         let current = settings::load(&root);
-        let outcome = update::apply(&root, &current)?;
+        let outcome = update::apply(&root, &current, force)?;
         log_line(&root, &format!("desktop updated to {} ({})", outcome.version, outcome.launcher));
         Ok::<_, String>(outcome)
     })
@@ -768,13 +833,7 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
                 append_log(&reader_state, &line);
                 log_line(&log_root, &format!("stdout: {line}"));
                 if let Some(url) = dsh::extract_url(&line) {
-                    {
-                        let mut inner = reader_state.lock();
-                        if inner.status.state == "starting" {
-                            inner.status.state = "ready";
-                            inner.status.url = Some(url.clone());
-                        }
-                    }
+                    adopt_ready_url(&reader_state, &url);
                     navigate(&reader_app, &url);
                 }
             }
@@ -794,12 +853,17 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
 
     let monitor_state = state.clone();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + STARTUP_TIMEOUT;
+        let mut slow_reported = false;
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let exited = {
                 let mut inner = monitor_state.lock();
-                if inner.status.state != "starting" {
+                // "slow" keeps this thread alive on purpose: a startup that is
+                // merely late must still notice a child that dies later, and it
+                // must still notice the ready line.
+                if !matches!(inner.status.state, "starting" | "slow") {
                     return;
                 }
                 inner.child.as_mut().and_then(|child| child.try_wait().ok().flatten()).map(|status| status.code())
@@ -812,21 +876,77 @@ fn launch(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
                 ));
                 return;
             }
-            if Instant::now() >= deadline {
-                monitor_state.set_error(format!("启动超时（{} 秒）。\n\n{}", STARTUP_TIMEOUT.as_secs(), monitor_state.log_tail(4000)));
-                return;
+            if !slow_reported && Instant::now() >= deadline {
+                // Say it once, report whether the child is still producing
+                // output, and keep waiting. This replaced a hard timeout that
+                // killed the monitor thread and reported a failure for a startup
+                // that was still perfectly healthy, just slow.
+                slow_reported = true;
+                let mut message = None;
+                {
+                    let mut inner = monitor_state.lock();
+                    if inner.status.state == "starting" {
+                        let slow = slow_start_message(started.elapsed(), inner.last_output_at.map(|at| at.elapsed()));
+                        inner.status.state = "slow";
+                        inner.status.message = Some(slow.clone());
+                        message = Some(slow);
+                    }
+                }
+                if let (Some(message), Ok(root)) = (message, env_root()) {
+                    log_line(&root, &message);
+                }
             }
         }
     });
     Ok(())
 }
 
+/// Adopt the ready URL parsed out of the child's output.
+///
+/// Both `starting` and `slow` are startups in flight: a launch that crossed the
+/// startup deadline and was reported as slow must still be able to become ready
+/// when its URL finally arrives, otherwise the window would keep announcing a
+/// slow startup behind an already loaded UI.
+fn adopt_ready_url(state: &AppState, url: &str) {
+    let mut inner = state.lock();
+    if matches!(inner.status.state, "starting" | "slow") {
+        inner.status.state = "ready";
+        inner.status.url = Some(url.to_string());
+        inner.status.message = None;
+    }
+}
+
+/// The one-time "still starting" line the startup screen shows past
+/// [`STARTUP_TIMEOUT`].
+///
+/// `since_output` is how long ago the child last wrote to stdout or stderr:
+/// output within [`STARTUP_SILENCE`] means the startup is still making progress,
+/// and a long silence is worth saying out loud because it is what a real hang
+/// looks like.
+fn slow_start_message(elapsed: Duration, since_output: Option<Duration>) -> String {
+    let progress = match since_output {
+        Some(silence) if silence <= STARTUP_SILENCE => format!("最近一次输出在 {} 秒前，看起来仍在推进", silence.as_secs()),
+        Some(silence) => format!("已经 {} 秒没有新的输出", silence.as_secs()),
+        None => "还没有收到任何输出".to_string(),
+    };
+    format!(
+        "DSH 仍在启动（已等待 {} 秒；{progress}）。继续等待不会被中断；若长时间没有变化，可点击“重试”或查看日志。",
+        elapsed.as_secs()
+    )
+}
+
 /// How much of the DSH child's output the startup screen keeps in memory.
 const MAX_LOG_BYTES: usize = 200_000;
 
 fn append_log(state: &AppState, line: &str) {
+    // Redact before buffering, not only on the way to disk: this buffer is what
+    // `log_tail` renders into the startup page, and the child inherits this
+    // process's environment, so a `*_KEY`/`*_TOKEN` value can appear in its
+    // output verbatim.
+    let line = redact(line, secret_values());
     let mut inner = state.lock();
-    inner.log.push_str(line);
+    inner.last_output_at = Some(Instant::now());
+    inner.log.push_str(&line);
     inner.log.push('\n');
     if inner.log.len() > MAX_LOG_BYTES {
         // `String::split_off` panics unless the index sits on a character
@@ -839,6 +959,211 @@ fn append_log(state: &AppState, line: &str) {
             cut -= 1;
         }
         inner.log = inner.log.split_off(cut);
+    }
+}
+
+/// True when a variable name looks like it holds a credential.
+///
+/// The same name test the official packaging script uses (`KEY|SECRET|TOKEN|
+/// PASSWORD`, case-insensitive). It is deliberately blunt: the cost of a missed
+/// credential in `shell.log` is a leaked key, the cost of a false positive is a
+/// redacted line.
+fn is_secret_name(name: &str) -> bool {
+    const MARKERS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
+    let upper = name.to_ascii_uppercase();
+    MARKERS.iter().any(|marker| upper.contains(marker))
+}
+
+/// The credential values worth redacting: named like a credential and long
+/// enough to be one.
+///
+/// Sorted longest first so the left-to-right scan in [`redact`] behaves like
+/// leftmost-longest matching when one value is a prefix of another.
+fn credential_values(entries: impl Iterator<Item = (String, String)>) -> Vec<String> {
+    let mut values: Vec<String> = entries
+        .filter(|(name, _)| is_secret_name(name))
+        .map(|(_, value)| value)
+        .filter(|value| value.len() >= MIN_SECRET_CHARS)
+        .collect();
+    values.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    values.dedup();
+    values
+}
+
+/// Credential values from this process's environment, read once.
+///
+/// Cached because this runs on the child-output reader thread for every line,
+/// and the environment cannot change under a running process.
+fn secret_values() -> &'static [String] {
+    static VALUES: OnceLock<Vec<String>> = OnceLock::new();
+    VALUES.get_or_init(|| {
+        credential_values(
+            std::env::vars_os()
+                .map(|(name, value)| (name.to_string_lossy().to_string(), value.to_string_lossy().to_string())),
+        )
+    })
+}
+
+/// Replace every credential value in `message` with `[REDACTED]`.
+///
+/// Two rules, because a value inherited from this process's environment is not
+/// the only way a credential reaches the log:
+///
+/// * by value — the shell hands its own environment to the DSH child, so any
+///   value of a variable named like a credential is replaced wherever the child
+///   echoes it back;
+/// * by query parameter name — the ready URL's `?token=…` is generated by DSH
+///   itself and is not in this environment at all, so only the *name* can
+///   identify it.
+///
+/// Values are replaced first: that pass scans the caller's text, so the marker it
+/// inserts can never be matched again by the parameter pass.
+fn redact(message: &str, secrets: &[String]) -> String {
+    redact_query_parameters(&redact_values(message, secrets))
+}
+
+/// Replace the given literal values with `[REDACTED]`.
+///
+/// A hand-written scan rather than a pattern match: this crate has no regex
+/// dependency, and replacing exact inherited values cannot be defeated by the
+/// escaping that would fool a regex. Only whole characters and whole values are
+/// copied, so multi-byte text around a value survives intact.
+fn redact_values(message: &str, secrets: &[String]) -> String {
+    const MARKER: &str = "[REDACTED]";
+    if secrets.is_empty() || message.is_empty() {
+        return message.to_string();
+    }
+    let bytes = message.as_bytes();
+    let mut redacted = String::with_capacity(message.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match secrets.iter().find(|secret| bytes[index..].starts_with(secret.as_bytes())) {
+            Some(secret) => {
+                redacted.push_str(MARKER);
+                index += secret.len();
+            }
+            None => {
+                // Every step advanced by a whole character or a whole secret, and
+                // secrets are UTF-8 themselves, so `index` is always a boundary.
+                let character = message[index..].chars().next().expect("index is on a character boundary");
+                redacted.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    redacted
+}
+
+/// The longest parameter name that is still treated as a name.
+const MAX_PARAM_NAME_CHARS: usize = 64;
+
+/// Replace the value of every `name=value` query parameter whose name looks like
+/// a credential, keeping the `?`/`&`, the name and the `=` as they were.
+///
+/// This does not parse URLs: a parameter is any run of name characters after
+/// `?` or `&` and before `=`, and its value ends at `&`, whitespace, or a
+/// character that would be a delimiter in the surrounding text (so a URL inside
+/// a JSON line keeps its closing quote).
+fn redact_query_parameters(message: &str) -> String {
+    const MARKER: &str = "[REDACTED]";
+    let bytes = message.as_bytes();
+    let mut redacted = String::with_capacity(message.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'?' || byte == b'&' {
+            let pair = query_parameter(message, index + 1).filter(|(name_end, value_end)| {
+                is_secret_name(&message[index + 1..*name_end]) && *value_end > *name_end + 1
+            });
+            if let Some((name_end, value_end)) = pair {
+                // `?name=` verbatim, then the marker instead of the value.
+                redacted.push(byte as char);
+                redacted.push_str(&message[index + 1..=name_end]);
+                redacted.push_str(MARKER);
+                index = value_end;
+                continue;
+            }
+        }
+        let character = message[index..].chars().next().expect("index is on a character boundary");
+        redacted.push(character);
+        index += character.len_utf8();
+    }
+    redacted
+}
+
+/// The bounds of the `name=value` pair starting at `start`, as
+/// `(index of '=', index just past the value)`; `None` when `start` does not
+/// begin a parameter.
+fn query_parameter(message: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = message.as_bytes();
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'=' {
+            // An empty name is not a parameter, and an unbroken 64-character run
+            // is prose rather than a name; both would turn this into a redactor
+            // that fires on ordinary text.
+            return (cursor > start && cursor - start <= MAX_PARAM_NAME_CHARS)
+                .then(|| (cursor, parameter_value_end(message, cursor + 1)));
+        }
+        if !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')) {
+            return None;
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// The end of a parameter value starting at `start`: the next `&`, whitespace,
+/// or delimiter, whichever comes first.
+fn parameter_value_end(message: &str, start: usize) -> usize {
+    let bytes = message.as_bytes();
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'&' || byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'<' | b'>' | b')' | b']' | b'}') {
+            break;
+        }
+        cursor += 1;
+    }
+    // The value is copied as text, so it must end on a character boundary.
+    while cursor > start && !message.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+/// Rotate `shell.log` to `shell.log.1` once it reaches `limit` bytes.
+///
+/// One generation is kept: the log explains the current startup, and an
+/// unbounded append is what let a long-running environment's log grow without
+/// limit. Returns whether a rotation happened.
+fn rotate_log(path: &Path, limit: u64) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else { return false };
+    if metadata.len() < limit {
+        return false;
+    }
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else { return false };
+    let previous = path.with_file_name(format!("{name}.1"));
+    let _ = std::fs::remove_file(&previous);
+    std::fs::rename(path, &previous).is_ok()
+}
+
+/// Append one line to `<env-root>/desktop-state/shell.log`.
+///
+/// This is the only place that writes the log, which is why rotation and value
+/// redaction live here: every line from the shell, the tray, the update path and
+/// the DSH child itself passes through this function.
+pub fn log_line(root: &Path, message: &str) {
+    let path = log_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    rotate_log(&path, MAX_LOG_FILE_BYTES);
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or(0);
+    let message = redact(message, secret_values());
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{millis}] {message}");
     }
 }
 
@@ -863,17 +1188,6 @@ fn webview_data_dir(root: &Path) -> PathBuf {
 
 fn log_path(root: &Path) -> PathBuf {
     settings::logs_path(root)
-}
-
-pub fn log_line(root: &Path, message: &str) {
-    let path = log_path(root);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or(0);
-        let _ = writeln!(file, "[{millis}] {message}");
-    }
 }
 
 fn update_cleanup_on_start() {
@@ -1000,5 +1314,195 @@ mod tests {
         assert!(log.len() <= MAX_LOG_BYTES + line.len(), "the log must stay bounded, got {}", log.len());
         assert!(log.chars().count() > 0);
         assert!(log.contains('环') || log.contains('境'), "truncation must keep whole characters");
+    }
+
+    /// Child output is what makes a late startup "slow but working" rather than
+    /// "silent and probably stuck", so every line must stamp the time.
+    #[test]
+    fn child_output_is_recorded_as_startup_progress() {
+        let state = AppState::default();
+        assert!(state.lock().last_output_at.is_none(), "a fresh shell has seen no output");
+        crate::append_log(&state, "dsh is working");
+        let first = state.lock().last_output_at.expect("output must be stamped");
+        std::thread::sleep(Duration::from_millis(5));
+        crate::append_log(&state, "dsh is still working");
+        let second = state.lock().last_output_at.expect("output must be stamped");
+        assert!(second > first, "the stamp must move forward with each line");
+    }
+
+    /// A startup that passed the deadline is a prompt, not a failure: the
+    /// message reports elapsed time and progress, and the state has to still be
+    /// able to become an error when the child dies after it.
+    #[test]
+    fn a_late_startup_is_a_prompt_that_can_still_fail() {
+        let recent = crate::slow_start_message(Duration::from_secs(181), Some(Duration::from_secs(3)));
+        assert!(recent.contains("仍在启动"), "{recent}");
+        assert!(recent.contains("仍在推进"), "{recent}");
+        let silent = crate::slow_start_message(Duration::from_secs(181), Some(Duration::from_secs(300)));
+        assert!(silent.contains("没有新的输出"), "{silent}");
+        let nothing = crate::slow_start_message(Duration::from_secs(181), None);
+        assert!(nothing.contains("还没有收到任何输出"), "{nothing}");
+
+        let state = AppState::default();
+        state.lock().status.state = "slow";
+        state.set_error("DSH 进程提前退出（exit code 1）。".to_string());
+        let inner = state.lock();
+        assert_eq!(inner.status.state, "error", "a slow startup must still be able to fail");
+    }
+
+    /// A startup reported as slow is still the startup: the ready line that
+    /// arrives after the deadline has to be adopted, and it has to clear the
+    /// notice so the startup page does not keep announcing a slow start.
+    #[test]
+    fn a_slow_startup_still_becomes_ready() {
+        let state = AppState::default();
+        {
+            let mut inner = state.lock();
+            inner.status.state = "slow";
+            inner.status.message = Some("DSH 仍在启动…".to_string());
+        }
+        crate::adopt_ready_url(&state, "http://127.0.0.1:3080/?token=x");
+        // The guard is scoped on purpose: this is a plain `std::sync::Mutex`, so
+        // holding it while locking again on the same thread deadlocks the whole
+        // test binary instead of failing the assertion.
+        {
+            let inner = state.lock();
+            assert_eq!(inner.status.state, "ready");
+            assert_eq!(inner.status.url.as_deref(), Some("http://127.0.0.1:3080/?token=x"));
+            assert!(inner.status.message.is_none());
+        }
+
+        // An already ready or failed startup is not overwritten by a later line.
+        crate::adopt_ready_url(&state, "http://127.0.0.1:1/");
+        assert_eq!(state.lock().status.url.as_deref(), Some("http://127.0.0.1:3080/?token=x"));
+    }
+
+    /// Only credential-looking names are collected, and only values long enough
+    /// to be a credential: a two-character value would rewrite ordinary log text.
+    #[test]
+    fn credential_values_are_selected_by_name_and_length() {
+        let entries = [
+            ("DEEPSEEK_API_KEY".to_string(), "sk-0123456789abcdef".to_string()),
+            ("MY_TOKEN".to_string(), "abcdefgh".to_string()),
+            ("SHORT_PASSWORD".to_string(), "pw".to_string()),
+            ("HTTPS_PROXY".to_string(), "http://127.0.0.1:7897".to_string()),
+            ("PATH".to_string(), "C:\\Windows".to_string()),
+        ];
+        let values = crate::credential_values(entries.into_iter());
+        assert_eq!(values, vec!["sk-0123456789abcdef".to_string(), "abcdefgh".to_string()]);
+    }
+
+    /// The token in the ready URL is generated by DSH, so it is not in this
+    /// shell's environment and the value pass cannot know it. Only its name can
+    /// identify it — and hiding it must not mangle the rest of the URL, because
+    /// that URL is the main diagnostic in the log.
+    #[test]
+    fn query_parameters_named_like_credentials_are_redacted_by_name() {
+        let ready = "dsh web: http://127.0.0.1:3080/?token=abc123";
+        assert_eq!(
+            crate::redact(ready, &[]),
+            "dsh web: http://127.0.0.1:3080/?token=[REDACTED]",
+            "the ready URL's token is not in the shell's environment"
+        );
+
+        let several = "GET /?a=1&token=xyz&b=2 done";
+        assert_eq!(crate::redact(several, &[]), "GET /?a=1&token=[REDACTED]&b=2 done");
+
+        // Name matching is case-insensitive and substring-based like the rest of
+        // the credential test, but `tok` is not a credential name.
+        assert_eq!(crate::redact("?TOKEN=abc", &[]), "?TOKEN=[REDACTED]");
+        assert_eq!(crate::redact("?access_token=abc", &[]), "?access_token=[REDACTED]");
+        assert_eq!(crate::redact("?tok=abc", &[]), "?tok=abc");
+        assert_eq!(crate::redact("?a=1 normal text", &[]), "?a=1 normal text");
+        // A URL inside a JSON line keeps its closing quote.
+        assert_eq!(
+            crate::redact(r#"{"url":"http://127.0.0.1:1/?password=hunter2"}"#, &[]),
+            r#"{"url":"http://127.0.0.1:1/?password=[REDACTED]"}"#
+        );
+    }
+
+    /// Replacing values must never cut a multi-byte character, in the value pass
+    /// or around a redacted query parameter.
+    #[test]
+    fn redaction_never_splits_a_character() {
+        let secrets = vec!["sk-0123456789abcdef".to_string()];
+        let line = "日志：环境密钥 sk-0123456789abcdef 已加载（中文说明）";
+        let redacted = crate::redact(line, &secrets);
+        assert_eq!(redacted, "日志：环境密钥 [REDACTED] 已加载（中文说明）");
+        assert!(redacted.contains('环') && redacted.contains('境'));
+
+        let url = "启动完成：http://127.0.0.1:3080/?token=中文令牌&done=是";
+        let redacted = crate::redact(url, &[]);
+        assert_eq!(redacted, "启动完成：http://127.0.0.1:3080/?token=[REDACTED]&done=是");
+        // The token's own characters are gone with it; the text around it is not.
+        assert!(redacted.contains('启') && redacted.contains('完') && redacted.contains("done=是"));
+    }
+
+    /// One runaway session must not be able to grow `shell.log` without limit,
+    /// and the generation it displaces is the one worth keeping.
+    #[test]
+    fn the_log_rotates_to_one_generation() {
+        let root = std::env::temp_dir().join(format!("dpx-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = crate::log_path(&root);
+        std::fs::create_dir_all(path.parent().expect("log directory")).expect("log directory");
+        std::fs::write(&path, "first generation").expect("write log");
+
+        assert!(!crate::rotate_log(&path, 1024), "an under-limit log must not rotate");
+        assert!(path.is_file());
+        assert!(crate::rotate_log(&path, 4), "an over-limit log must rotate");
+        assert!(!path.exists(), "the rotated log is renamed away, not truncated");
+        assert_eq!(std::fs::read_to_string(path.with_file_name("shell.log.1")).expect("generation"), "first generation");
+
+        // The next append recreates the live file beside the kept generation.
+        crate::log_line(&root, "second generation");
+        assert!(std::fs::read_to_string(&path).expect("live log").contains("second generation"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The end-to-end claim the settings window and the acceptance script both
+    /// depend on: whatever reaches `log_line` reaches the file with the token
+    /// gone. This is the real sink, so it is tested through the real file.
+    #[test]
+    fn the_log_file_never_contains_a_plaintext_token() {
+        let root = std::env::temp_dir().join(format!("dpx-log-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("log root");
+        crate::log_line(&root, "stdout: dsh web: http://127.0.0.1:3080/?token=abc123");
+        let text = std::fs::read_to_string(crate::log_path(&root)).expect("log file");
+        assert!(!text.contains("?token=abc123"), "{text}");
+        assert!(text.contains("?token=[REDACTED]"), "{text}");
+        assert!(text.contains("http://127.0.0.1:3080/"), "the URL must stay diagnosable: {text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2's probe only ever reports this shell's own child: no child means no
+    /// prompt, and a child that already exited is not "still running".
+    #[test]
+    fn only_a_live_child_is_reported() {
+        use std::process::{Command, Stdio};
+
+        let state = AppState::default();
+        assert!(state.live_child_pid().is_none(), "no child means nothing to warn about");
+
+        let mut child = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "20", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("20");
+            command
+        };
+        let child = child.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("helper child");
+        let pid = child.id();
+        state.lock().child = Some(child);
+        assert_eq!(state.live_child_pid(), Some(pid), "a live child must be reported with its pid");
+
+        let mut child = state.lock().child.take().expect("child handle");
+        let _ = child.kill();
+        let _ = child.wait();
+        state.lock().child = Some(child);
+        assert!(state.live_child_pid().is_none(), "an exited child must not be reported");
     }
 }
