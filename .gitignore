@@ -5,3 +5,12 @@ coverage/
 *.log
 .env
 .DS_Store
+
+# local branch folders
+dev-*
+exp-*
+fix-*
+pr-*
+release-*
+test
+backup
