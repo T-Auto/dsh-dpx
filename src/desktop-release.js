@@ -530,7 +530,12 @@ export async function fetchDesktopRelease(source, {
   let effectiveTag = tag ?? parsed.tag;
   if (!effectiveTag && prerelease && parsed.kind === 'github') {
     effectiveTag = await resolveLatestPrereleaseTag(parsed.repository, { proxy: effectiveProxy, env, timeout, apiBase });
-    if (!effectiveTag) throw new Error(`No pre-release ${DESKTOP_TAG_PREFIX}* release found in ${parsed.repository}.`);
+    // An empty prerelease channel is the same situation as a channel with no
+    // published release: `checkDesktopUpdate` maps a 404 to `no-release`, so the
+    // check reports it instead of failing the command.
+    if (!effectiveTag) {
+      throw new HttpError(`No pre-release ${DESKTOP_TAG_PREFIX}* release found in ${parsed.repository}.`, { status: 404 });
+    }
   }
   const manifestUrl = desktopManifestUrl(parsed, { tag: effectiveTag });
   const text = await httpGet(manifestUrl, {
