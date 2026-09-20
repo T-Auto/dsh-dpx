@@ -46,6 +46,30 @@ if (-not $Version) { $Version = $shellPackage.version }
 $Version = $Version.Trim().TrimStart('v')
 if ($Version -notmatch '^\d+\.\d+\.\d+') { throw "Invalid desktop version: $Version" }
 
+# Three source manifests also declare this version: `package.json` (the npm side),
+# `Cargo.toml` (the crate, and what a plain `cargo build` reports) and
+# `tauri.conf.json` (the Windows file properties). `-Version` is passed in, so
+# bumping only one of them would silently produce an EXE whose own version
+# disagrees with the manifest that installs it. Refuse that artifact.
+#
+# `-SkipPackagedArtifact` builds a local demo of an older version and writes no
+# packaged manifest, so it warns instead of throwing: there is nothing to publish
+# and therefore nothing for the mismatch to mislead.
+$manifestVersions = [ordered]@{
+  'desktop-shell/package.json'              = [string]$shellPackage.version
+  'desktop-shell/src-tauri/Cargo.toml'      = [string]((Select-String -Path (Join-Path $shell 'src-tauri\Cargo.toml') -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value)
+  'desktop-shell/src-tauri/tauri.conf.json' = [string]((Get-Content (Join-Path $shell 'src-tauri\tauri.conf.json') -Raw | ConvertFrom-Json).version)
+}
+$mismatched = @($manifestVersions.GetEnumerator() | Where-Object { $_.Value -ne $Version })
+if ($mismatched.Count -gt 0) {
+  $detail = ($mismatched | ForEach-Object { "$($_.Key) declares '$($_.Value)'" }) -join '; '
+  if ($SkipPackagedArtifact) {
+    Write-Warning "Building v$Version while $detail. This is only safe because -SkipPackagedArtifact writes no packaged manifest."
+  } else {
+    throw "Desktop version '$Version' does not match the source manifests: $detail. Bump every manifest before building, or pass -SkipPackagedArtifact for a local demo build."
+  }
+}
+
 # Session-only toolchain activation; no user/system PATH is modified. On a machine
 # with a local rustup install we select it explicitly instead of relying on a
 # global default; on CI (or any machine with rustc on PATH) nothing is touched.
