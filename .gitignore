@@ -12,7 +12,11 @@ exp-*
 fix-*
 pr-*
 release-*
-test
 backup
+
+# The sandbox folder holds scratch clones, i.e. directories. This repository
+# keeps its own unit tests in the same folder as `test/*.test.js` (see the
+# `test` script in package.json), so only subdirectories may be ignored.
+test/*/
 
 .workspace/
