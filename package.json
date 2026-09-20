@@ -24,7 +24,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node scripts/run-tests.mjs test/*.test.js",
     "check": "npm run test && node --check bin/dpx.js && node --check src/index.js && node --check src/http.js && node --check src/desktop-release.js && node --check src/environment-guide.js",
     "desktop:build": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1",
     "desktop:release": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-launcher.ps1 -OutputDirectory dist",
