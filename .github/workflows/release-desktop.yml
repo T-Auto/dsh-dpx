@@ -216,12 +216,19 @@ jobs:
             $auth = gh auth status 2>&1
             $auth | ForEach-Object { Write-Host $_ }
           } finally { $ErrorActionPreference = $previous }
-          $arguments = @('-Directory', 'dist', '-Upload')
+          $parameters = @{ Directory = 'dist' }
           $key = 'assets/windows/desktop-release-pub.txt'
-          if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
-          else { Write-Host "::notice title=Unsigned release::No packaged public key at $key, so no signature is required." }
+          if (Test-Path $key) {
+            $parameters.RequireSignature = $true
+            $parameters.PublicKey = (Resolve-Path $key).Path
+          } else {
+            Write-Host "::notice title=Unsigned release::No packaged public key at $key, so no signature is required."
+          }
+          # Hashtable splatting carries parameter *names*; an array splat passes
+          # its elements positionally, so `-Upload` inside `@arguments` binds
+          # nothing and the script refuses the call.
           try {
-            ./scripts/publish-desktop-release.ps1 @arguments -Notes $env:DPX_RELEASE_NOTES
+            ./scripts/publish-desktop-release.ps1 @parameters -Upload -Notes $env:DPX_RELEASE_NOTES
           } catch {
             Write-Host "::error title=Desktop release upload failed::$($_.Exception.Message)"
             throw
@@ -233,11 +240,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $arguments = @('-Directory', 'dist', '-Publish')
+          $parameters = @{ Directory = 'dist' }
           $key = 'assets/windows/desktop-release-pub.txt'
-          if (Test-Path $key) { $arguments += @('-RequireSignature', '-PublicKey', (Resolve-Path $key).Path) }
+          if (Test-Path $key) {
+            $parameters.RequireSignature = $true
+            $parameters.PublicKey = (Resolve-Path $key).Path
+          }
           try {
-            ./scripts/publish-desktop-release.ps1 @arguments
+            ./scripts/publish-desktop-release.ps1 @parameters -Publish
           } catch {
             Write-Host "::error title=Desktop release publish failed::$($_.Exception.Message)"
             throw

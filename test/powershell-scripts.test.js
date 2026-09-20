@@ -19,6 +19,7 @@ import test from 'node:test';
 
 const scriptsDir = join(import.meta.dirname, '..', 'scripts');
 const scripts = readdirSync(scriptsDir).filter(name => name.endsWith('.ps1')).sort();
+const releaseWorkflow = join(import.meta.dirname, '..', '.github', 'workflows', 'release-desktop.yml');
 
 /** Parse one script with the Windows PowerShell parser; returns its diagnostics. */
 function parseDiagnostics(path) {
@@ -37,6 +38,25 @@ test('every release script parses under Windows PowerShell 5.1', () => {
   for (const name of scripts) {
     const { status, output } = parseDiagnostics(join(scriptsDir, name));
     assert.equal(status, 0, `${name} does not parse under Windows PowerShell: ${output}`);
+  }
+});
+
+test('the release workflow hands the publish script its switches literally', () => {
+  // PowerShell's array splatting passes its elements as *positional* arguments, so
+  // a parameter name inside `@arguments` never binds: the script would read
+  // '-Directory' as its -Directory value and see neither switch, then refuse the
+  // call on its own mutual-exclusion check. That is how every 0.3.0 release
+  // attempt died in CI with nothing but "exit code 1". Hashtable splatting is the
+  // form that carries parameter names, and the step must pass its switch as a
+  // literal on the command line.
+  const calls = readFileSync(releaseWorkflow, 'utf8')
+    .split('\n')
+    .filter(line => line.includes('publish-desktop-release.ps1'));
+  assert.ok(calls.length >= 2, `expected the workflow to call the publish script twice, found ${calls.length}`);
+  for (const line of calls) {
+    assert.doesNotMatch(line, /@arguments/, `array splatting cannot bind a switch: ${line.trim()}`);
+    assert.match(line, /@parameters\b/, `the step must splat a hashtable of parameter names: ${line.trim()}`);
+    assert.match(line, / -(Upload|Publish)\b/, `the step must pass its switch literally: ${line.trim()}`);
   }
 });
 
