@@ -799,7 +799,13 @@ export async function removeEnvironment({ name, home = defaultRegistryHome(), pu
     const [record] = registry.environments.splice(index, 1);
     const expected = environmentRoot(dirname(dirname(record.root)), name);
     if (resolve(record.root) !== expected) throw new Error(`Refusing to remove environment with an unsafe root: ${record.root}`);
-    if (purge && existsSync(record.root)) await rm(record.root, { recursive: true, force: false });
+    // Purging is the one operation that must survive a real Windows directory
+    // tree. On Windows an indexer, an antivirus scanner or a DSH child that has
+    // just been asked to exit can hold a handle for a moment and fail the delete
+    // with EBUSY/EPERM; Node's `rm` only retries when `maxRetries` says so, and
+    // its default of 0 means the first transient failure would otherwise leave a
+    // half-deleted environment behind.
+    if (purge && existsSync(record.root)) await rm(record.root, { recursive: true, force: false, maxRetries: 5, retryDelay: 200 });
     registry.revision += 1;
     await atomicJson(registryPath(home), registry);
     return { record, purged: purge && !existsSync(record.root), dryRun: false };
