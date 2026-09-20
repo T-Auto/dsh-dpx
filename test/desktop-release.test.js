@@ -378,3 +378,49 @@ test('client errors are not retried, and the retry budget is bounded', async () 
     assert.equal(routes.get('/down.json').hits, 3);
   });
 });
+
+test('an asset whose byte count disagrees with the manifest is rejected', async () => {
+  await withReleaseServer(async ({ base, routes, asset }) => {
+    const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+    const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+    const record = await createEnvironment({ name: 'test', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+    // The digest is correct; only the declared length is wrong.
+    const declared = manifest('0.2.1', { bytes: asset, assetUrl: 'asset.exe' });
+    declared.size = asset.length + 1;
+    routes.set('/desktop-latest.json', { body: JSON.stringify(declared) });
+    routes.set('/asset.exe', { type: 'application/octet-stream', body: asset });
+
+    await assert.rejects(
+      updateDesktopLauncher({ envRoot: record.root, source: `${base}/desktop-latest.json` }),
+      /size mismatch/,
+    );
+    assert.equal(existsSync(desktopLauncherPath(record.root)), false);
+  });
+});
+
+test('an older release is never available and never replaces a newer launcher', async () => {
+  await withReleaseServer(async ({ base, routes, asset }) => {
+    const storage = await mkdtemp(join(tmpdir(), 'dpx-storage-'));
+    const home = await mkdtemp(join(tmpdir(), 'dpx-registry-'));
+    const record = await createEnvironment({ name: 'test', storageRoot: storage, home, publishDiscovery: false, desktop: false, platform: 'win32' });
+    const newerBytes = Buffer.from(`newer-launcher-${'n'.repeat(64)}`);
+    routes.set('/new.json', { body: JSON.stringify(manifest('0.3.0', { bytes: newerBytes, assetUrl: 'new.exe' })) });
+    routes.set('/new.exe', { type: 'application/octet-stream', body: newerBytes });
+    assert.equal((await updateDesktopLauncher({ envRoot: record.root, source: `${base}/new.json` })).updated, true);
+
+    // The channel is replaced by an older build with different bytes. Only-upgrade
+    // means this must neither be advertised nor installed.
+    routes.set('/old.json', { body: JSON.stringify(manifest('0.2.1', { bytes: asset, assetUrl: 'old.exe' })) });
+    routes.set('/old.exe', { type: 'application/octet-stream', body: asset });
+
+    const check = await checkDesktopUpdate({ envRoot: record.root, source: `${base}/old.json` });
+    assert.equal(check.available, false);
+    assert.equal(check.reason, 'different-build');
+    assert.equal(check.installedNewer, true);
+
+    const refused = await updateDesktopLauncher({ envRoot: record.root, source: `${base}/old.json` });
+    assert.equal(refused.updated, false);
+    assert.equal(refused.reason, 'newer-installed');
+    assert.deepEqual(await readFile(desktopLauncherPath(record.root)), newerBytes);
+  });
+});
