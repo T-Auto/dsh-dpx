@@ -11,6 +11,29 @@
 
 > 当前状态：实验性、Windows 优先。需要 Node.js `>=22.19.0`。`0.1.0` 已实现命名隔离安装、DPX 发现 profile、环境内 DSH/TUI 启动；`dsh-tui --环境名` 的全局启动器兼容层需要由 `dsh-tui` 项目接入，详见[“`dsh-tui --test`”](#dsh-tui---test-统一启动体验)。
 
+## 与 `dsh-distribution` 的关系（消费覆盖）
+
+`dsh-distribution` 定义"一个 DSH 环境如何被外部世界识别、发现、管理与迁移"的环境元协议；本仓库是它的一个**实现范例**，不是它的标准来源，也不是唯一的环境管理器。协议正文与条款 ID 以该仓库的 `docs/proposals/` 为准；本仓库只负责：实现它、并如实说明自己实现了哪些面。
+
+仓库根的 [`dsh-distribution.json`](dsh-distribution.json) 是本仓库作为发行物的自我声明。它当前声明 **7 个协议面里的 2 个**：
+
+| `dsh-distribution` 协议面 | 本仓库是否声明/实现 | 证据 |
+| --- | --- | --- |
+| 身份与声明（`DistributionDescriptor`） | ✅ 声明 | [`dsh-distribution.json`](dsh-distribution.json) 本体 |
+| 受管存储归属（`ManagedLayout`） | ✅ 声明 | 同上：`environment-root`、`registry` 两个独占资源（`exclusive` + `conditional`） |
+| 发现与环境实例（`EnvironmentDiscovery` + `EnvironmentInstance`） | ✅ 声明 | 描述符中的 `references`；运行期写入的实例记录与注册表（`src/index.js` 的 `EnvironmentInstance` 记录与 instanceId 唯一性校验） |
+| 环境组成声明（`EnvironmentComposition`） | ❌ 未声明 | 无 |
+| 环境生命周期观察（`EnvironmentLifecycle`） | ❌ 未声明 | 无 |
+| 可迁移性计划与恢复日志（`EnvironmentPortability`） | ❌ 未声明 | 无 |
+| 可枚举共识入口（`Lodgement`） | ❌ 未声明 | 无 |
+
+未声明的面不表示"不适用"，只表示本仓库**没有**为此提供实现或证据。因此：
+
+- 不要据本仓库推断 `dsh-distribution` 已被完整实现——它目前只在"身份 + 归属 + 发现"三面有实现证据；
+- 也不要据本仓库推断某个环境管理器是唯一选择；协议明确允许私有坐标与非中央的多来源模型；
+- 描述符可以离线校验。用一个实现了该协议的校验器读它（例如 `dsh-distribution` 仓库的 `packages/conformance` CLI），应当得到 `valid: true, complete: true`：
+  这两项只说明**结构完整**，不说明来源可信、隔离成立或有权执行管理操作。
+
 ## 与普通 DSH 插件安装的区别
 
 例如，TUI 这类 DSH 插件可用普通 npm 全局安装：
