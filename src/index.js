@@ -2,10 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
-import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, installBundledDesktopLauncher } from './desktop-release.js';
+import { DESKTOP_LAUNCHER_DIR, DESKTOP_LAUNCHER_NAME, DESKTOP_STAMP_NAME, DESKTOP_STAMP_SCHEMA_VERSIONS, installBundledDesktopLauncher } from './desktop-release.js';
 import { ENVIRONMENT_MANIFEST_NAME, GUIDE_FORMAT, ensureEnvironmentGuide, environmentGuidePath } from './environment-guide.js';
 
 export const FORMAT = 1;
@@ -14,6 +14,204 @@ export const DISTRIBUTION = Object.freeze({
   id: 'urn:dsh:distribution:t-auto:dsh-dpx',
   version: '0.1.0',
 });
+
+/**
+ * Every distribution identity this build can still *read*, newest first.
+ *
+ * The registry stores the distribution identity it was written with, and every
+ * command reads the registry, so a naive equality test against `DISTRIBUTION`
+ * turns "bump the version" into "every existing environment becomes
+ * unreadable". The separation that prevents that:
+ *
+ * - **declared read compatibility** (`DISTRIBUTION_READ_COMPATIBLE_*`) — an
+ *   explicit list; a record inside it is readable, a record outside it still
+ *   fails loudly;
+ * - **write always stamps current** — every record this build writes uses
+ *   `DISTRIBUTION` verbatim, so the list grows only by a deliberate declaration
+ *   and never by drift.
+ *
+ * Add the outgoing identity to these lists *in the same change* that bumps
+ * `DISTRIBUTION`; `REGISTRY_BINDING` below is what enforces it.
+ */
+export const DISTRIBUTION_READ_COMPATIBLE_VERSIONS = Object.freeze(['0.1.0']);
+export const DISTRIBUTION_READ_COMPATIBLE_IDS = Object.freeze([DISTRIBUTION.id]);
+
+/** Aliases: the name upstream uses for the same policy (`compatibleVersions`). */
+export const COMPATIBLE_DISTRIBUTION_VERSIONS = DISTRIBUTION_READ_COMPATIBLE_VERSIONS;
+export const COMPATIBLE_DISTRIBUTION_IDS = DISTRIBUTION_READ_COMPATIBLE_IDS;
+
+/**
+ * The one place that decides whether a stored distribution identity is readable.
+ *
+ * `id` may change only with the version (`id 变化等价于换代`): a record whose id
+ * this build never wrote cannot be assumed to mean the same thing, so it is
+ * rejected even if its version is listed.
+ */
+export const REGISTRY_BINDING = Object.freeze({
+  readableVersions: DISTRIBUTION_READ_COMPATIBLE_VERSIONS,
+  readableIds: DISTRIBUTION_READ_COMPATIBLE_IDS,
+  readCompatible(distribution) {
+    const version = distribution?.version;
+    const id = distribution?.id;
+    return DISTRIBUTION_READ_COMPATIBLE_IDS.includes(id) && DISTRIBUTION_READ_COMPATIBLE_VERSIONS.includes(version);
+  },
+  /** `true` when a readable record is *behind* the current identity (`换代`). */
+  isStale(distribution) {
+    return this.readCompatible(distribution)
+      && (distribution.version !== DISTRIBUTION.version || distribution.id !== DISTRIBUTION.id);
+  },
+});
+
+/**
+ * Damage grading: how a damaged file is handled, by domain.
+ *
+ * The judgement is "can this data be rebuilt from something else?" — not "is it
+ * important?".
+ *
+ * - `authoritative` — the file *is* the fact (the registry, an environment's own
+ *   identity record, a distribution descriptor). Damage must stop the command:
+ *   guessing here would let dpx act on a fiction.
+ * - `derived` — the file is a reading of something else (a package manifest's
+ *   version, a profile's dependency list, a desktop update log). Damage is
+ *   reported with its file path and skipped, because a doctor that refuses to
+ *   run on the very damage it exists to find is useless.
+ *
+ * Every reader below returns the same shape, so a caller never has to guess
+ * which of the two it is holding: `{ ok, value, problem, path }`, where
+ * `problem.code` is `'missing'` (nothing there), `'unreadable'` (there, but not
+ * readable) or `'damaged'` (readable bytes, unusable content).
+ */
+export const DAMAGE_DOMAINS = Object.freeze({
+  authoritative: Object.freeze(['registry.json', ENVIRONMENT_MANIFEST_NAME, 'dsh-distribution.json']),
+  derived: Object.freeze([
+    'package.json (version)', 'profile package.json', 'desktop-state/updates.jsonl', 'desktop/.dpx-desktop.json',
+  ]),
+  policy: 'authoritative domains fail loud; derived domains report-and-skip',
+});
+
+/** Read and parse one JSON document, classifying every failure reason. */
+export function readJsonDocument(path, { domain = 'derived' } = {}) {
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: false, problem: { code: 'missing', path, message: '文件不存在' }, domain, path };
+    return { ok: false, problem: { code: 'unreadable', path, message: error.message }, domain, path };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text), path, domain };
+  } catch (error) {
+    return { ok: false, problem: { code: 'damaged', path, message: error.message }, domain, path };
+  }
+}
+
+const DAMAGE_CODE_LABELS = Object.freeze({ missing: '缺失', unreadable: '不可读', damaged: '损坏' });
+
+/** A one-line, user-facing rendering of a `problem` (`缺失` / `不可读` / `损坏`). */
+export function describeDamage(problem) {
+  if (!problem) return '未知问题';
+  return `${DAMAGE_CODE_LABELS[problem.code] ?? problem.code}：${problem.path}${problem.message ? `（${problem.message}）` : ''}`;
+}
+
+/** The version a package manifest declares, keeping the reason it is unknown. */
+export function packageVersionReport(directory) {
+  const path = join(directory, 'package.json');
+  const read = readJsonDocument(path, { domain: 'derived' });
+  if (!read.ok) return read;
+  if (typeof read.value?.version !== 'string') {
+    return { ok: false, value: undefined, path, domain: 'derived', problem: { code: 'damaged', path, message: 'package.json 没有字符串 version 字段' } };
+  }
+  return { ok: true, value: read.value.version, path, domain: 'derived' };
+}
+
+/**
+ * The plugin compatibility anchor.
+ *
+ * This is the machine-readable half of `docs/plugin-compat.md` (the prose lives
+ * in its own file, because a schema that exists only in a document is not a
+ * contract). It answers one question for a plugin author and for `dpx env
+ * doctor`: **which `@deepseek-ai/dsh` releases is this dpx build's plugin
+ * contract valid against?**
+ *
+ * Two deliberate choices, both of them corrections of a tempting mistake:
+ *
+ * - the anchor is the **`@deepseek-ai/dsh` version range plus a protocol
+ *   number**, never the desktop launcher's version. dpx's whole point is that a
+ *   launcher serves many dsh versions
+ *   (`docs/desktop-release.md`: "Upgrading DSH never needs a new launcher"), so
+ *   anchoring on the launcher would re-create the exact co-qualification that
+ *   mechanism exists to avoid;
+ * - it is **not** written into `dsh-distribution.json`. That descriptor's schema
+ *   is `additionalProperties: false`
+ *   (`spec/dsh-distribution/packages/core/schema/descriptor.schema.json`), so an
+ *   extra key there is a protocol violation, not an extension. The anchor is
+ *   surfaced by `dpx descriptor` (which already owns that output) instead.
+ */
+export const PLUGIN_COMPAT = Object.freeze({
+  /** The coordination point: which package's versions this anchor constrains. */
+  anchorPackage: '@deepseek-ai/dsh',
+  /** Declared readable dsh range (npm semver range syntax). */
+  dshRange: '>=0.1.0',
+  /** Lowest dsh version the range admits, for the human-readable verdict. */
+  minimum: '0.1.0',
+  /** dpx's own plugin-contract protocol number. Bump only with a breaking change. */
+  protocolVersion: 1,
+  /** One line explaining what must *not* be used as the anchor. */
+  forbiddenAnchor: '桌面启动器版本号（dpx 的核心语义是一个启动器服务多个 dsh 版本；用它做锚点等于把两者重新绑死）',
+  /** The npm target a plugin author resolves against. */
+  target: 'dsh',
+});
+
+/** `true` when `version` satisfies `PLUGIN_COMPAT.dshRange`. */
+export function pluginCompatible(version) {
+  const parsed = parseComparableVersion(version);
+  if (!parsed) return false;
+  for (const alternative of String(PLUGIN_COMPAT.dshRange).split('||')) {
+    const clauses = alternative.trim().split(/\s+/).filter(Boolean);
+    if (clauses.every(clause => versionSatisfiesClause(parsed, clause))) return true;
+  }
+  return false;
+}
+
+/**
+ * A comparable version, or undefined when the text is not one.
+ *
+ * Only three numeric components plus an optional pre-release are needed: dpx
+ * compares *dsh* release versions, which follow that shape. Anything else is
+ * "unknown", and an unknown version is never guessed into a range.
+ */
+export function parseComparableVersion(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(value ?? '').trim());
+  if (!match) return undefined;
+  return { parts: [Number(match[1]), Number(match[2]), Number(match[3])], pre: match[4] };
+}
+
+function compareParsedVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left.parts[index] !== right.parts[index]) return left.parts[index] < right.parts[index] ? -1 : 1;
+  }
+  if (left.pre === right.pre) return 0;
+  if (!left.pre) return 1;
+  if (!right.pre) return -1;
+  return left.pre < right.pre ? -1 : 1;
+}
+
+function versionSatisfiesClause(version, clause) {
+  const operator = /^(>=|<=|>|<|=|\^|~)?\s*(.+)$/.exec(clause);
+  if (!operator) return false;
+  const bound = parseComparableVersion(operator[2]);
+  if (!bound) return false;
+  const comparison = compareParsedVersions(version, bound);
+  switch (operator[1]) {
+    case '>=': return comparison >= 0;
+    case '<=': return comparison <= 0;
+    case '>': return comparison > 0;
+    case '<': return comparison < 0;
+    case '^': return comparison >= 0 && version.parts[0] === bound.parts[0];
+    case '~': return comparison >= 0 && version.parts[0] === bound.parts[0] && version.parts[1] === bound.parts[1];
+    default: return comparison === 0;
+  }
+}
 
 /**
  * Environment identity handed to every child dpx launches.
@@ -112,12 +310,30 @@ export function environmentRootFromProcess(env = process.env, platform = process
 
 /** The `DPXEnvironment` record stored in an environment root, if it is one. */
 function environmentManifest(root) {
-  try {
-    const raw = JSON.parse(readFileSync(join(resolve(root), ENVIRONMENT_MANIFEST_NAME), 'utf8'));
-    return raw?.kind === 'DPXEnvironment' && typeof raw.root === 'string' ? raw : undefined;
-  } catch {
-    return undefined;
+  return environmentManifestReport(root).manifest;
+}
+
+/**
+ * The same read, with the reason a non-dpx root was not recognized.
+ *
+ * `environmentRootFromProcess` only ever wants the value (and deliberately
+ * treats "not a dpx root" and "damaged record" as the same non-answer, because
+ * it is asking who *this* process is, not auditing a directory). The registry
+ * doctor wants the difference, and gets it from `problem`.
+ */
+export function environmentManifestReport(root) {
+  const absolute = resolve(root);
+  const path = join(absolute, ENVIRONMENT_MANIFEST_NAME);
+  const read = readJsonDocument(path, { domain: 'authoritative' });
+  if (!read.ok) return { manifest: undefined, path, read };
+  if (read.value?.kind !== 'DPXEnvironment' || typeof read.value.root !== 'string') {
+    return {
+      manifest: undefined,
+      path,
+      read: { ...read, ok: false, problem: { code: 'damaged', path, message: `不是 DPXEnvironment 记录（kind=${JSON.stringify(read.value?.kind)}）` } },
+    };
   }
+  return { manifest: read.value, path, read };
 }
 
 /**
@@ -219,6 +435,11 @@ export function pathsFor(root) {
     xdgCache: join(absolute, 'xdg-cache'),
     xdgData: join(absolute, 'xdg-data'),
     workspace: join(absolute, 'workspace'),
+    // Desktop shell state (logs, WebView profile) lives inside the environment
+    // root so `dpx env remove --purge` cannot leave it behind on the host.
+    desktopState: join(absolute, 'desktop-state'),
+    // The desktop shell owns this append-only update journal; dpx only reads it.
+    updates: join(absolute, 'desktop-state', 'updates.jsonl'),
     descriptor: join(absolute, 'dsh-distribution.json'),
     manifest: join(absolute, ENVIRONMENT_MANIFEST_NAME),
     desktopDir: join(absolute, DESKTOP_LAUNCHER_DIR),
@@ -329,6 +550,32 @@ export async function loadRegistry(home) {
   }
 }
 
+/**
+ * The same read, without throwing, for read-only callers.
+ *
+ * `dpx env doctor` must be able to *report* a damaged registry, so it needs a
+ * path that returns the damage instead of raising it. Authoritative-domain
+ * fail-loud is preserved where it belongs: every mutating command still calls
+ * `loadRegistry`, which refuses to overwrite a registry it cannot validate.
+ *
+ * @returns `{ registry, problems }`; `registry` is `newRegistry()` when the file
+ *   is absent, and `undefined` when it exists but cannot be trusted.
+ */
+export async function readRegistryReport(home) {
+  const path = registryPath(home);
+  const read = readJsonDocument(path, { domain: 'authoritative' });
+  if (!read.ok) {
+    if (read.problem.code === 'missing') return { registry: newRegistry(), problems: [] };
+    return { registry: undefined, problems: [read.problem] };
+  }
+  try {
+    validateRegistry(read.value);
+  } catch (error) {
+    return { registry: undefined, problems: [{ code: 'damaged', path, message: error.message }] };
+  }
+  return { registry: read.value, problems: [] };
+}
+
 function validateRegistry(registry) {
   if (!registry || registry.format !== FORMAT || !Number.isSafeInteger(registry.revision) || registry.revision < 0 || !Array.isArray(registry.environments)) {
     throw new Error('Registry format is invalid; refusing to overwrite it.');
@@ -339,8 +586,20 @@ function validateRegistry(registry) {
     if (!row || row.apiVersion !== DPX_API_VERSION || row.kind !== 'DPXEnvironment') throw new Error('Registry has an invalid environment record.');
     const name = assertEnvironmentName(row.name);
     if (name !== row.name || names.has(name) || ids.has(row.instance.instanceId)) throw new Error('Registry has duplicate or invalid environment identities.');
-    if (!isAbsolute(row.root) || row.instance.apiVersion !== 'discovery.distribution.dsh.dev/v1alpha1' || row.instance.kind !== 'EnvironmentInstance' || row.instance.distribution?.id !== DISTRIBUTION.id || row.instance.distribution?.version !== DISTRIBUTION.version) {
+    if (!isAbsolute(row.root) || row.instance.apiVersion !== 'discovery.distribution.dsh.dev/v1alpha1' || row.instance.kind !== 'EnvironmentInstance') {
       throw new Error('Registry environment binding is invalid.');
+    }
+    // Read compatibility, not equality: an environment written by an older dpx
+    // is still readable (see REGISTRY_BINDING). An identity this build never
+    // wrote is not, and says so with the two lists a reader needs to act.
+    if (!REGISTRY_BINDING.readCompatible(row.instance.distribution)) {
+      throw new Error(
+        `Registry environment --${row.name} binds distribution `
+        + `${row.instance.distribution?.id}@${row.instance.distribution?.version ?? '(no version)'}, `
+        + `which this dpx cannot read. Readable ids: ${DISTRIBUTION_READ_COMPATIBLE_IDS.join(', ')}; `
+        + `readable versions: ${DISTRIBUTION_READ_COMPATIBLE_VERSIONS.join(', ')}. `
+        + 'If that distribution is a newer dpx, upgrade dpx; do not edit the registry by hand.',
+      );
     }
     if (row.desktop !== undefined && (!row.desktop || row.desktop.platform !== 'win32' || row.desktop.launcher !== desktopLauncherRelative())) {
       throw new Error('Registry desktop launcher binding is invalid.');
@@ -461,8 +720,78 @@ export async function resolveEnvironment(name, home = defaultRegistryHome()) {
   return record;
 }
 
-export async function removeEnvironment({ name, home = defaultRegistryHome(), purge = false }) {
+/**
+ * What `dpx env remove` would change, computed without touching anything.
+ *
+ * This is the *same* code path the real removal runs (`removeEnvironment` calls
+ * it inside the registry lock and then applies it), so a `--dry-run` cannot
+ * drift from what the real command does. It deliberately does not call
+ * `resolveEnvironment`: that would run `ensureEnvironmentScaffold`, and a
+ * preview that writes files is not a preview.
+ */
+export async function environmentRemovalPlan({ name, home = defaultRegistryHome(), purge = false, platform = process.platform } = {}) {
   name = assertEnvironmentName(name);
+  const registry = await loadRegistry(home);
+  const index = registry.environments.findIndex(row => row.name === name);
+  if (index < 0) throw new Error(`Environment --${name} is not registered.`);
+  const record = registry.environments[index];
+  const expected = environmentRoot(dirname(dirname(record.root)), name);
+  if (resolve(record.root) !== expected) throw new Error(`Refusing to remove environment with an unsafe root: ${record.root}`);
+  const paths = pathsFor(record.root);
+  const rootExists = existsSync(record.root);
+  const desktopStateExists = existsSync(paths.desktopState);
+  const remaining = registry.environments.length - 1;
+  return {
+    name,
+    home,
+    purge,
+    record,
+    registry: {
+      path: registryPath(home),
+      // The record is dropped either way; the revision always moves.
+      revision: { from: registry.revision, to: registry.revision + 1 },
+      removesRecordFor: name,
+      remainingRecords: remaining,
+    },
+    root: {
+      path: record.root,
+      exists: rootExists,
+      action: purge ? (rootExists ? 'delete' : 'already-missing') : 'keep',
+      // Everything below lives inside the root, which is why purging the root
+      // is the whole of the environment's removal.
+      includes: [
+        { path: paths.npmPrefix, label: '环境内 npm 全局目录' },
+        { path: paths.dshHome, label: 'DSH_HOME（profiles / sessions / 本环境指南）' },
+        { path: paths.agentsHome, label: 'agents / skills' },
+        { path: paths.descriptor, label: 'distribution descriptor' },
+        { path: paths.manifest, label: '环境身份记录' },
+      ],
+    },
+    desktop: {
+      dir: paths.desktopDir,
+      launcher: paths.desktop,
+      exists: existsSync(paths.desktop),
+      action: purge ? (rootExists ? 'delete-with-root' : 'already-missing') : 'keep',
+      state: { path: paths.desktopState, exists: desktopStateExists, action: purge ? 'delete-with-root' : 'keep' },
+    },
+    discovery: {
+      key: WINDOWS_DISCOVERY_KEY,
+      // dpx owns this pointer and only ever removes it when no environment is
+      // left; a per-environment removal leaves it in place.
+      action: remaining === 0 ? (platform === 'win32' ? 'evaluate-and-remove-own-key' : 'not-applicable') : 'keep',
+      pointer: platform === 'win32' ? windowsDiscoveryRegistryPath(platform) : undefined,
+    },
+    platform,
+  };
+}
+
+export async function removeEnvironment({ name, home = defaultRegistryHome(), purge = false, dryRun = false, platform = process.platform }) {
+  name = assertEnvironmentName(name);
+  if (dryRun) {
+    // Still wrapped in the lock: the plan must be read against a stable
+    // registry, and holding the lock changes nothing on disk.
+    return withRegistryLock(home, async () => ({ plan: await environmentRemovalPlan({ name, home, purge, platform }), purged: false, dryRun: true }));
+  }
   return withRegistryLock(home, async () => {
     const registry = await loadRegistry(home);
     const index = registry.environments.findIndex(row => row.name === name);
@@ -473,7 +802,7 @@ export async function removeEnvironment({ name, home = defaultRegistryHome(), pu
     if (purge && existsSync(record.root)) await rm(record.root, { recursive: true, force: false });
     registry.revision += 1;
     await atomicJson(registryPath(home), registry);
-    return { record, purged: purge && !existsSync(record.root) };
+    return { record, purged: purge && !existsSync(record.root), dryRun: false };
   });
 }
 
@@ -579,14 +908,22 @@ export function locatePackage(paths, packageName) {
   return undefined;
 }
 
-/** Read the version a package manifest declares, without failing on damage. */
+/**
+ * Read the version a package manifest declares, without failing on damage.
+ *
+ * The returning API shape is unchanged (an unknown version is `undefined`); the
+ * *reason* it is unknown is available from `packageVersionReport`, which is what
+ * lets `dpx env doctor` say "文件损坏" instead of "未知版本".
+ */
 export function packageVersionAt(directory) {
-  try {
-    const raw = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
-    return typeof raw?.version === 'string' ? raw.version : undefined;
-  } catch {
-    return undefined;
-  }
+  const report = packageVersionReport(directory);
+  const version = report.ok ? report.value : undefined;
+  return typeof version === 'string' ? version : undefined;
+}
+
+/** What `packageVersionAt` reads, plus the part of the environment it came from. */
+export function describePackageVersion(directory) {
+  return packageVersionReport(directory);
 }
 
 export function launchSpec(paths, target) {
@@ -655,12 +992,39 @@ export async function installPackagedDesktopLauncher(envRoot, env = process.env)
 
 /** Version of the desktop launcher recorded for an environment, if any. */
 export function desktopVersion(envRoot) {
-  try {
-    const raw = JSON.parse(readFileSync(join(envRoot, DESKTOP_LAUNCHER_DIR, '.dpx-desktop.json'), 'utf8'));
-    return typeof raw?.version === 'string' ? raw.version : undefined;
-  } catch {
-    return undefined;
+  return desktopVersionReport(envRoot).value;
+}
+
+/**
+ * The same read, keeping the reason a stamp is unreadable, and honouring the
+ * stamp schema whitelist that `readDesktopStamp` enforces.
+ *
+ * Without that check `dpx env show` would happily print a version read out of a
+ * stamp that `dpx desktop status` reports as damaged — the same file described
+ * two different ways by two commands. A stamp outside
+ * `DESKTOP_STAMP_SCHEMA_VERSIONS` is therefore "unknown version" here too.
+ */
+export function desktopVersionReport(envRoot) {
+  const path = join(envRoot, DESKTOP_LAUNCHER_DIR, DESKTOP_STAMP_NAME);
+  const read = readJsonDocument(path, { domain: 'derived' });
+  if (!read.ok) return read;
+  const schemaVersion = Number(read.value?.schemaVersion);
+  if (!Number.isInteger(schemaVersion) || !DESKTOP_STAMP_SCHEMA_VERSIONS.includes(schemaVersion)) {
+    return {
+      ok: false,
+      value: undefined,
+      path,
+      domain: 'derived',
+      problem: {
+        code: 'damaged',
+        path,
+        message: `桌面启动器标记的 schemaVersion ${JSON.stringify(read.value?.schemaVersion)} 不在支持的版本里`
+          + `（${DESKTOP_STAMP_SCHEMA_VERSIONS.join(', ')}）——与 dpx desktop status 的判定保持一致`,
+      },
+    };
   }
+  const version = typeof read.value?.version === 'string' ? read.value.version : undefined;
+  return { ok: true, value: version, path, domain: 'derived' };
 }
 
 export function displayEnvironment(record) {
@@ -814,14 +1178,23 @@ export function targetCopies(paths, target) {
   const entry = launchTarget(target);
   if (!entry) return { target, package: undefined, copies: [] };
   const copies = [];
+  // `versionReport` rides along so a caller can tell "this copy is not
+  // installed" from "this copy's manifest is damaged" without reading it again.
+  const copyOf = (location, directory) => {
+    const versionReport = packageVersionReport(directory);
+    return {
+      location,
+      path: directory,
+      version: versionReport.ok ? versionReport.value : undefined,
+      versionReport,
+    };
+  };
   const globalPackage = locatePackage(paths, entry.package);
-  if (globalPackage) {
-    copies.push({ location: 'npm-prefix', path: globalPackage, version: packageVersionAt(globalPackage) });
-  }
+  if (globalPackage) copies.push(copyOf('npm-prefix', globalPackage));
   for (const profile of listProfiles(paths)) {
     const directory = join(paths.dshHome, 'profiles', profile, 'node_modules', ...entry.package.split('/'));
     if (!existsSync(directory)) continue;
-    copies.push({ location: `profile:${profile}`, path: directory, version: packageVersionAt(directory) });
+    copies.push(copyOf(`profile:${profile}`, directory));
   }
   return { target, package: entry.package, entry: join(...entry.entry), copies };
 }
@@ -902,6 +1275,212 @@ export function readProfileInstaller(profileDir) {
 /** The pnpm store dpx expects a child of this environment to use. */
 export function expectedPnpmStore(paths) {
   return join(paths.xdgData, 'pnpm', 'store');
+}
+
+// ---------------------------------------------------------------------------
+// `dpx env repair`: a recovery entry point that does not depend on the failures
+// it recovers from
+// ---------------------------------------------------------------------------
+//
+// Aligned with the upstream native recovery action (see
+// `apps/desktop/README.zh.md`, "恢复操作…": it disables third-party bundles and
+// renames the profile's `cordis.patch.yml` to `cordis.patch.yml.bak-<timestamp>`,
+// **without parsing it**, and keeps installed packages and every other manifest
+// field). Two properties matter and are easy to lose:
+//
+//   * the patch file is never parsed — parsing is what fails when a patch is the
+//     thing that broke the profile;
+//   * only `dsh.profile.bundles` is narrowed. `dependencies`, `overrides`, and
+//     `node_modules` are untouched, so no package has to be reinstalled.
+//
+// The bundle list is *not* a second authority in this repository. It comes from
+// the installed `@deepseek-ai/dsh-app-boot` (`PROFILE_TEMPLATES`) when that
+// export exists, and `dpx` refuses to write bundles it cannot source rather than
+// freezing a copy of upstream's list. `sanitizeProfile` itself is only exported
+// by dsh >= 0.1.6-alpha.2 source, so it is *probed*: used when present, and
+// replaced by a local equivalent (same policy, no parsing) when absent.
+
+/** Probe for the exported helpers of the installed `@deepseek-ai/dsh-app-boot`. */
+export async function probeAppBoot(paths) {
+  const dshPackage = locatePackage(paths, 'dsh') ?? locatePackage(paths, '@deepseek-ai/dsh');
+  if (!dshPackage) {
+    return { available: false, reason: `环境内没有安装 ${PLUGIN_COMPAT.anchorPackage}`, templates: undefined };
+  }
+  const appBoot = join(dshPackage, 'node_modules', '@deepseek-ai', 'dsh-app-boot');
+  if (!existsSync(appBoot)) {
+    return { available: false, reason: `没有找到 ${appBoot}（npm 会把 dsh 的依赖树嵌在 dsh 之下）`, templates: undefined };
+  }
+  try {
+    const module = await import(pathToFileURL(join(appBoot, 'lib', 'index.js')).href);
+    return {
+      available: true,
+      module,
+      path: appBoot,
+      templates: module.PROFILE_TEMPLATES,
+      patchFileName: module.PROFILE_PATCH_FILENAME,
+      hasSanitizeProfile: typeof module.sanitizeProfile === 'function',
+      hasWriteProfileBundles: typeof module.writeProfileBundles === 'function',
+    };
+  } catch (error) {
+    return { available: false, reason: `import() 失败：${error.message}`, path: appBoot, templates: undefined };
+  }
+}
+
+/** Profile names upstream ships a template for, plus their ordered bundles. */
+export function profileTemplateNames(templates) {
+  return Object.keys(templates ?? {}).sort();
+}
+
+function bundlesForProfile(templates, profile) {
+  const bundles = templates?.[profile]?.bundles;
+  return Array.isArray(bundles) && bundles.length ? [...bundles] : undefined;
+}
+
+/**
+ * Write one profile's `cordis.patch.yml` aside and narrow its bundles.
+ *
+ * Never parses the patch. Never re-serializes the whole manifest: the manifest
+ * is re-read, only `dsh.profile.bundles` is replaced, and the result is written
+ * as UTF-8 **without a BOM** — the workspace has a recorded accident where a
+ * PowerShell `Set-Content -Encoding utf8` BOM made `JSON.parse` throw and the
+ * app would not start. Two-space JSON plus a trailing newline is what upstream's
+ * `writeProfileManifest` produces, so a repaired manifest is byte-comparable
+ * with a freshly initialized one.
+ */
+export async function repairProfileDirectory(profileDir, { bundles, patchFileName = 'cordis.patch.yml', dryRun = false, timestamp = Date.now() } = {}) {
+  if (!Array.isArray(bundles) || bundles.length === 0) {
+    throw new Error('repairProfileDirectory needs the bundle list to narrow to; refusing to guess one.');
+  }
+  const patchPath = join(profileDir, patchFileName);
+  const manifestPath = join(profileDir, 'package.json');
+  const manifestReport = readJsonDocument(manifestPath, { domain: 'authoritative' });
+  if (!manifestReport.ok) {
+    throw new Error(`Cannot repair profile ${profileDir}: manifest is unusable — ${describeDamage(manifestReport.problem)}`);
+  }
+  const record = { profileDir, patchPath, manifestPath, bundles };
+  // The backup name is chosen even under `--dry-run`, from the same loop the
+  // real run uses, so the preview names the exact file the real run creates.
+  const backupBase = `${patchPath}.bak-${timestamp}`;
+  let backupPath = backupBase;
+  let ordinal = 0;
+  while (existsSync(backupPath)) backupPath = `${backupBase}-${++ordinal}`;
+  const patchExists = existsSync(patchPath);
+  record.backupPath = patchExists ? backupPath : undefined;
+  record.patchExists = patchExists;
+  const before = manifestReport.value?.dsh?.profile?.bundles;
+  record.bundlesBefore = Array.isArray(before) ? [...before] : undefined;
+  record.changed = JSON.stringify(record.bundlesBefore ?? null) !== JSON.stringify(bundles);
+  if (dryRun) return record;
+  if (patchExists) {
+    // rename, not copy: the patch must stop being loaded in the same step it is
+    // preserved, and dsh re-creates an empty one on the next boot.
+    await rename(patchPath, backupPath);
+  }
+  const updated = {
+    ...manifestReport.value,
+    dsh: { ...manifestReport.value.dsh, profile: { ...manifestReport.value.dsh?.profile, bundles: [...bundles] } },
+  };
+  await writeFile(manifestPath, `${JSON.stringify(updated, null, 2)}\n`, { encoding: 'utf8' });
+  record.bundlesAfter = [...bundles];
+  return record;
+}
+
+/**
+ * Repair every profile of one environment.
+ *
+ * `profiles` defaults to every existing profile. A named profile that does not
+ * exist yet is created from the upstream template when upstream has one, and is
+ * refused otherwise — dpx will not invent a bundle list.
+ */
+export async function repairEnvironment({
+  name,
+  home = defaultRegistryHome(),
+  profiles,
+  dryRun = false,
+  platform = process.platform,
+  timestamp = Date.now(),
+  registryHome,
+} = {}) {
+  name = assertEnvironmentName(name);
+  const registry = await loadRegistry(home);
+  const record = registry.environments.find(row => row.name === name);
+  if (!record) throw new Error(`Environment --${name} is not registered. Create it with: dpx npm install -g @deepseek-ai/dsh --${name} --<absolute-storage-root>`);
+  const paths = pathsFor(record.root);
+  if (!existsSync(paths.root)) throw new Error(`Environment --${name} is registered but its root is missing: ${paths.root}`);
+  const probe = await probeAppBoot(paths);
+  if (!probe.available || !probe.templates) {
+    throw new Error(
+      `无法确定 profile 的内建 bundle 集合：${probe.reason ?? '上游未导出 PROFILE_TEMPLATES'}。`
+      + `dpx 不会硬编码第二份 bundle 清单。请先安装/修复环境内的 ${PLUGIN_COMPAT.anchorPackage}：dpx npm install -g ${PLUGIN_COMPAT.anchorPackage} --${name}`,
+    );
+  }
+  const requested = profiles?.length ? profiles : undefined;
+  const known = listProfiles(paths);
+  const targets = requested?.filter(profile => known.includes(profile))
+    ?? (known.length ? known : profileTemplateNames(probe.templates));
+  const results = [];
+  const created = [];
+  for (const profile of targets) {
+    const bundles = bundlesForProfile(probe.templates, profile);
+    if (!bundles) {
+      results.push({
+        profile,
+        repaired: false,
+        reason: 'no-upstream-template',
+        message: `上游 PROFILE_TEMPLATES 里没有 ${JSON.stringify(profile)} 的 bundle 集合；dpx 不猜。`
+          + `可用的 profile：${profileTemplateNames(probe.templates).join(', ') || '(none)'}`,
+      });
+      continue;
+    }
+    const directory = profileDirectory(paths, profile);
+    if (!existsSync(directory)) {
+      if (requested) created.push(profile);
+      if (!dryRun) await mkdir(directory, { recursive: true });
+    }
+    const repair = await repairProfileDirectory(directory, { bundles, patchFileName: probe.patchFileName ?? 'cordis.patch.yml', dryRun, timestamp });
+    results.push({ profile, repaired: true, created: !existsSync(join(directory, 'package.json')), ...repair });
+  }
+  // Repair always stamps the current distribution identity: this is the one
+  // place that legitimately rewrites a registry record, and "write always
+  // stamps current" is what keeps older environments inside the read whitelist.
+  const outcome = {
+    environment: name,
+    envRoot: paths.root,
+    registry: registryHome ?? home,
+    dryRun,
+    bundlesSource: `${PLUGIN_COMPAT.anchorPackage} → ${probe.path ?? 'dsh-app-boot'} (PROFILE_TEMPLATES)`,
+    // What the probe found, and therefore which implementation answered:
+    // `sanitizeProfile` is only exported by dsh >= 0.1.6-alpha.2. The local
+    // equivalent is preferred even when it exists, because it never parses the
+    // profile manifest and writes a BOM-free manifest by construction — the two
+    // failure modes this command exists to survive.
+    capabilities: {
+      sanitizeProfile: probe.hasSanitizeProfile ? 'available-upstream' : 'absent-upstream',
+      writeProfileBundles: probe.hasWriteProfileBundles ? 'available-upstream' : 'absent-upstream',
+      implementation: 'local-equivalent',
+      reason: probe.hasSanitizeProfile
+        ? '上游 sanitizeProfile 需要先解析 manifest（本命令的恢复前提恰恰是它可能不可解析），故使用不解析的本地等价实现'
+        : '上游未导出 sanitizeProfile（它只在 dsh >= 0.1.6-alpha.2 源码里导出），使用本地等价实现',
+    },
+    created,
+    profiles: results,
+  };
+  if (!dryRun) {
+    // Everything that writes happens above; the registry stamp is the one
+    // metadata change, and it is written through the same atomic path as
+    // every other registry mutation.
+    await withRegistryLock(home, async () => {
+      const current = await loadRegistry(home);
+      const row = current.environments.find(candidate => candidate.name === name);
+      if (!row) return;
+      row.instance = { ...row.instance, distribution: DISTRIBUTION };
+      row.discoverableEntry = discoverableEntry(row.instance, row.name);
+      current.revision += 1;
+      await atomicJson(registryPath(home), current);
+    });
+    outcome.registryStamped = DISTRIBUTION.version;
+  }
+  return outcome;
 }
 
 export function profileDirectory(paths, profile) {
@@ -990,8 +1569,32 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
     push('environment-guide', current ? 'ok' : 'warn',
       current ? `环境级指令文件是最新格式（v${GUIDE_FORMAT}）：${guide}`
         : `环境级指令文件是旧格式，缺少本次新增的排查与通用规则：${guide}`,
-      current ? undefined : `dpx env show --${name} 会就地刷新它（标记块之外的内容不动）`);
+      current ? undefined : `dpx env show --${name} 会就地刷新它（标记块之外的内容不动）；`
+        + `若旧托管区与仓库中该格式的模板不逐字节一致，dpx 会拒绝改写并提示，请人工确认后再刷新`);
   }
+
+  // The environment's own record is authoritative here: it is the last piece of
+  // evidence that answers "which environment am I in?" when the identity
+  // variables have been stripped. A damaged record is damage, not merely
+  // "unknown" — that distinction is the whole point of the graded policy.
+  const manifestReport = environmentManifestReport(paths.root);
+  if (manifestReport.read.ok) {
+    push('environment-record', 'ok', `环境身份记录可读：${manifestReport.path}`);
+  } else if (manifestReport.read.problem.code === 'missing') {
+    push('environment-record', 'warn', `环境身份记录不存在：${manifestReport.path}（进程身份反推会失效）`,
+      `重建该记录：dpx env repair --${name}，或删除后重新创建该环境`);
+  } else {
+    push('environment-record', 'error', `环境身份记录不可用——${describeDamage(manifestReport.read.problem)}`,
+      `修好或删除 ${manifestReport.path} 后重建：dpx env repair --${name}；这会让进程身份反推失效，直到修好为止`);
+  }
+
+  // Derived-domain damage is collected while walking and reported once, so a
+  // damaged file never masquerades as "未知版本" without saying which file.
+  const damagedDerived = [];
+  const noteDerivedDamage = (report, label) => {
+    if (!report || report.ok || report.problem?.code !== 'damaged') return;
+    damagedDerived.push({ label, ...report.problem });
+  };
 
   const identity = environmentRootFromProcess(env, process.platform);
   const declared = env[DPX_ENV_ROOT_VARIABLE]?.trim();
@@ -1029,6 +1632,10 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
           : `PATH 上没有环境外的 ${target} 副本`);
     }
     const copies = report.copies;
+    // "未知版本" and "文件损坏" are different findings with different fixes, so
+    // the damaged case is named with its path instead of collapsing into
+    // `copy.version === undefined`.
+    for (const copy of copies) noteDerivedDamage(copy.versionReport, `${target} @ ${copy.location}`);
     const global = copies.find(copy => copy.location === 'npm-prefix');
     const profiles = copies.filter(copy => copy.location.startsWith('profile:'));
     if (global && profiles.length) {
@@ -1045,10 +1652,35 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
     }
   }
 
+  // The plugin compatibility anchor: the environment's *dsh* version against the
+  // range dpx declares, never against the desktop launcher's version.
+  const dshPackage = locatePackage(paths, PLUGIN_COMPAT.anchorPackage);
+  const dshVersion = dshPackage ? packageVersionAt(dshPackage) : undefined;
+  if (!dshPackage) {
+    push('plugin-compat', 'ok', `环境内没有安装 ${PLUGIN_COMPAT.anchorPackage}；锚点区间 ${PLUGIN_COMPAT.dshRange}（协议号 ${PLUGIN_COMPAT.protocolVersion}）暂不适用`,
+      `dpx npm install -g ${PLUGIN_COMPAT.anchorPackage} --${name}`);
+  } else if (dshVersion === undefined) {
+    const report = packageVersionReport(dshPackage);
+    push('plugin-compat', 'error',
+      `${PLUGIN_COMPAT.anchorPackage} 的版本读不出来——${describeDamage(report.problem)}，无法核对插件兼容锚点`,
+      `重装该包：dpx npm install -g ${PLUGIN_COMPAT.anchorPackage} --${name}`);
+  } else if (pluginCompatible(dshVersion)) {
+    push('plugin-compat', 'ok',
+      `环境内 ${PLUGIN_COMPAT.anchorPackage}=${dshVersion} 落在锚点区间 ${PLUGIN_COMPAT.dshRange}（协议号 ${PLUGIN_COMPAT.protocolVersion}）`);
+  } else {
+    push('plugin-compat', 'error',
+      `环境内 ${PLUGIN_COMPAT.anchorPackage}=${dshVersion} 不在锚点区间 ${PLUGIN_COMPAT.dshRange} 内；`
+      + '插件兼容锚点只认 dsh 版本，不认桌面启动器版本',
+      `dpx npm install -g ${PLUGIN_COMPAT.anchorPackage}@<区间内版本> --${name}`);
+  }
+
   const expectedStore = expectedPnpmStore(paths);
   const profiles = listProfiles(paths);
   for (const profile of profiles) {
     const directory = profileDirectory(paths, profile);
+    // A profile manifest that exists but cannot be parsed is damage, and it is
+    // exactly the damage that silently empties `plugin add`'s read-back.
+    noteDerivedDamage(readJsonDocument(join(directory, 'package.json'), { domain: 'derived' }), `profile:${profile} package.json`);
     const installer = readProfileInstaller(directory);
     if (!installer) continue;
     if (!installer.storeDir) {
@@ -1076,6 +1708,41 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
     }
   }
 
+  // Desktop update journal (R6, read side) and the launcher stamp. This is a
+  // *read-only* check: the journal belongs to the desktop shell, and a doctor
+  // that created `desktop-state/` merely by looking would be lying about being
+  // read-only.
+  noteDerivedDamage(desktopVersionReport(paths.root), `desktop/${DESKTOP_STAMP_NAME}`);
+  const journal = readDesktopUpdateJournal(paths.updates);
+  if (journal.records.length === 0 && journal.problems.length === 0) {
+    push('desktop-updates', 'ok', `没有桌面端更新记录（${paths.updates} 不存在或为空），无需处置`);
+  } else {
+    const last = journal.records.at(-1);
+    const failed = journal.records.filter(row => row.result !== undefined && row.result !== 'success' && row.result !== 'ok');
+    if (journal.problems.length) {
+      push('desktop-updates', 'warn',
+        `桌面端更新记录有 ${journal.problems.length} 行不可用，已跳过：${journal.problems.slice(0, 3).map(problem => problem.message).join('；')}`,
+        `检查 ${paths.updates}，坏行与未知 schemaVersion 不会被猜测解析`);
+    }
+    push('desktop-updates:last', failed.length ? 'error' : 'ok',
+      last
+        ? `最近一条桌面端更新记录：${last.time ?? '(无时间)'} ${last.action ?? '(无动作)'} `
+          + `${last.fromVersion ?? '?'} → ${last.toVersion ?? last.fromVersion ?? '?'} result=${last.result ?? '(无结果)'}`
+        : '更新记录里没有可读条目',
+      last ? undefined : `检查 ${paths.updates} 的内容`);
+    if (failed.length) {
+      push('desktop-updates:failures', 'error',
+        `${failed.length} 条桌面端更新记录的结果不是成功：${failed.slice(-3).map(row => `${row.time ?? '?'}:${row.result}`).join('、')}`,
+        `重跑一次并保留现场：dpx desktop update --${name}；更新记录在 ${paths.updates}`);
+    }
+  }
+
+  for (const damage of damagedDerived) {
+    push(`damaged-file:${damage.label}`, 'error',
+      `派生域文件损坏（已跳过，不参与其它判定）——${describeDamage(damage)}`,
+      `修复或删除该文件后重跑 dpx env doctor --${name}；派生域可以重建，权威域（registry 与环境身份记录）不会这样处理`);
+  }
+
   const errors = checks.filter(row => row.status === 'error').length;
   const warnings = checks.filter(row => row.status === 'warn').length;
   return {
@@ -1086,6 +1753,184 @@ export function doctorReport({ paths, name, record, env = process.env, registry,
     summary: { errors, warnings, checks: checks.length },
     checks,
     ...(record?.instance ? { instanceId: record.instance.instanceId } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Registry-level `dpx env doctor` (no `--<name>`)
+// ---------------------------------------------------------------------------
+//
+// The single-environment report above answers "is THIS environment healthy?".
+// This one answers "is the registry itself coherent, and which records are safe
+// to unregister?" — a different question with a different output contract, so
+// the two deliberately do not share a shape beyond `{ ok, summary, checks }`:
+//
+//   single (--name)   { environment, envRoot, registry, ok, summary, checks, instanceId? }
+//   registry (no name){ scope: 'registry', registry, entries[], ok, summary, checks }
+//
+// No `envRoot`, no `environment`, no `instanceId` at the top level: a consumer
+// that wants one environment must ask for one. Everything here is read-only —
+// in particular it never calls `resolveEnvironment`, so a registry-level check
+// cannot create a missing root, a guide file, or a `desktop-state/` directory.
+
+function desktopCapability(record) {
+  return record?.desktop?.platform === 'win32' && record.desktop.launcher ? 'declared' : 'none';
+}
+
+/**
+ * One read-only pass over every registry record.
+ *
+ * @returns `{ scope, registry, revision, entries, ok, summary, checks }`; each
+ *   entry carries the same per-record checks under `entry.checks`, plus a
+ *   `safeToUnregister` verdict that names the exact command.
+ */
+export async function registryDoctorReport({ home = defaultRegistryHome(), env = process.env, platform = process.platform } = {}) {
+  const path = registryPath(home);
+  const { registry, problems } = await readRegistryReport(home);
+  const checks = [];
+  const push = (...args) => { checks.push(check(...args)); };
+
+  // Authoritative domain: an unreadable registry is fail-loud everywhere else,
+  // and here it is reported as the top-level verdict rather than thrown, so the
+  // operator can see the registry doctor complain about its own input.
+  if (problems.length) {
+    for (const problem of problems) {
+      push('registry-readable', 'error', `registry 不可用——${describeDamage(problem)}`,
+        `先修好或移走 ${path}；dpx 不会覆盖一个无法校验的 registry（负载是权威域）`);
+    }
+    const errors = checks.filter(row => row.status === 'error').length;
+    return {
+      scope: 'registry',
+      registry: home,
+      registryPath: path,
+      revision: undefined,
+      entries: [],
+      ok: false,
+      summary: { errors, warnings: 0, checks: checks.length },
+      checks,
+    };
+  }
+
+  push('registry-readable', 'ok', `registry 格式与全部记录绑定可读：${path}（revision ${registry.revision}）`);
+  push('registry-revision', 'ok', `registry revision=${registry.revision}，共 ${registry.environments.length} 条记录`);
+
+  // The discovery pointer is a machine-level fact, not a per-record one.
+  const pointer = platform === 'win32' ? windowsDiscoveryRegistryPath(platform) : undefined;
+  if (platform !== 'win32') {
+    push('discovery-pointer', 'ok', `非 Windows 平台不使用 ${WINDOWS_DISCOVERY_KEY}，跳过`);
+  } else if (registry.environments.length === 0) {
+    push('discovery-pointer', 'ok', 'registry 里没有环境，discovery pointer 无需指向任何地方');
+  } else if (!pointer) {
+    push('discovery-pointer', 'warn', `${WINDOWS_DISCOVERY_KEY} 不存在或不可读；环境内的 dpx 将回落到隔离的 LOCALAPPDATA`,
+      '在宿主机上重跑一次 dpx env list（或 dpx env repair --<name>）以重新发布 discovery pointer');
+  } else if (samePath(pointer, path, platform)) {
+    push('discovery-pointer', 'ok', `${WINDOWS_DISCOVERY_KEY} 指向本 registry：${path}`);
+  } else if (env.DPX_DISABLE_DISCOVERY === '1') {
+    // Publishing was explicitly switched off, so a pointer aimed at another
+    // registry is expected here, not a defect of this one. Reporting it as an
+    // error would make `dpx env doctor` fail on every isolated/CI registry.
+    push('discovery-pointer', 'warn',
+      `${WINDOWS_DISCOVERY_KEY} 指向另一个 registry：${pointer}（本 registry 是 ${path}），`
+      + '但 DPX_DISABLE_DISCOVERY=1 明确不发布 pointer，符合预期',
+      '需要让环境内的 dpx 找到本 registry 时，去掉 DPX_DISABLE_DISCOVERY 再跑一次 dpx env list');
+  } else {
+    push('discovery-pointer', 'error', `${WINDOWS_DISCOVERY_KEY} 指向另一个 registry：${pointer}（本 registry 是 ${path}）`,
+      `确认 DPX_HOME；需要改回时用 DPX_HOME=${home} 重跑一次环境操作以重新发布 pointer`);
+  }
+
+  const entries = [];
+  for (const record of registry.environments) {
+    const entryChecks = [];
+    const entryPush = (...args) => { entryChecks.push(check(...args)); };
+    const paths = pathsFor(record.root);
+    const rootExists = existsSync(record.root);
+    entryPush('root', rootExists ? 'ok' : 'error',
+      rootExists ? `环境根存在：${record.root}` : `环境根缺失：${record.root}`,
+      rootExists ? undefined : `dpx env remove --${record.name} 注销这条失效记录（不删任何文件）`);
+
+    // descriptor / manifest presence, and — when both exist — instanceId
+    // agreement. The manifest is the environment's own claim about itself, so a
+    // disagreement is an identity problem, not a missing-file problem.
+    const descriptorReport = readJsonDocument(paths.descriptor, { domain: 'authoritative' });
+    entryPush('descriptor', descriptorReport.ok ? 'ok' : 'error',
+      descriptorReport.ok ? `descriptor 存在且可解析：${paths.descriptor}` : `descriptor 不可用——${describeDamage(descriptorReport.problem)}`,
+      descriptorReport.ok ? undefined : `重新生成：dpx env repair --${record.name}；仍不行则注销后重建该环境`);
+    const manifestReport = environmentManifestReport(record.root);
+    entryPush('manifest', manifestReport.read.ok ? 'ok' : 'error',
+      manifestReport.read.ok ? `环境身份记录存在且可解析：${manifestReport.path}` : `环境身份记录不可用——${describeDamage(manifestReport.read.problem)}`,
+      manifestReport.read.ok ? undefined : `重新生成：dpx env repair --${record.name}`);
+
+    const manifestInstance = manifestReport.manifest?.instance?.instanceId;
+    const registryInstance = record.instance?.instanceId;
+    if (manifestInstance === undefined) {
+      entryPush('instance-id', 'warn', '环境身份记录里没有 instanceId，无法与 registry 记录比对',
+        `重建该记录：dpx env repair --${record.name}`);
+    } else if (manifestInstance === registryInstance) {
+      entryPush('instance-id', 'ok', `instanceId 与 registry 记录一致：${registryInstance}`);
+    } else {
+      entryPush('instance-id', 'error',
+        `instanceId 不一致：registry=${registryInstance ?? '(none)'}，环境记录=${manifestInstance}`
+        + '（同一个名字指向了两份不同的环境身份）',
+        `确认哪一份是真的；要保留环境里的那份，就注销后按该 root 重新登记：dpx env remove --${record.name}`);
+    }
+
+    // Desktop capability vs what is actually on disk.
+    const capability = desktopCapability(record);
+    const launcherExists = existsSync(paths.desktop);
+    if (capability === 'declared' && launcherExists) {
+      entryPush('desktop-capability', 'ok', `记录声明 win32 桌面启动器，且文件存在：${paths.desktop}`
+        + `${desktopVersion(record.root) ? `（版本 ${desktopVersion(record.root)}）` : ''}`);
+    } else if (capability === 'declared' && !launcherExists) {
+      entryPush('desktop-capability', 'warn', `记录声明 win32 桌面启动器，但文件不存在：${paths.desktop}`,
+        rootExists ? `重新安装：dpx desktop install --${record.name}` : `环境根已缺失；注销该记录即可：dpx env remove --${record.name}`);
+    } else if (capability === 'none' && launcherExists) {
+      entryPush('desktop-capability', 'warn', `记录没有声明桌面能力，但环境里存在桌面启动器：${paths.desktop}`,
+        `确认后重装桌面端：dpx desktop install --${record.name}，或删掉该文件`);
+    } else {
+      entryPush('desktop-capability', 'ok', '记录没有声明桌面能力，环境里也没有桌面启动器（CLI-only 环境）');
+    }
+
+    // Safe to unregister = the record can be dropped without losing anything
+    // dpx still needs. A missing root is the textbook case; an identity
+    // disagreement is not, because dropping the record would lose the only
+    // pointer to the on-disk environment.
+    const errors = entryChecks.filter(row => row.status === 'error');
+    const safeToUnregister = !rootExists || errors.every(row => row.id === 'root' || row.id === 'descriptor' || row.id === 'manifest');
+    entryPush('unregister', safeToUnregister ? (rootExists ? 'warn' : 'ok') : 'ok',
+      safeToUnregister
+        ? (rootExists
+          ? `可以安全注销：dpx env remove --${record.name}（不加 --purge 时环境目录原样保留）`
+          : `root 已缺失，注销是纯 registry 修复：dpx env remove --${record.name}`)
+        : '不建议现在注销：先处理上面的身份/文件问题，注销会丢掉指向该环境根的唯一指针',
+      safeToUnregister ? `dpx env remove --${record.name}${rootExists ? '' : ' --purge'}` : undefined);
+
+    entries.push({
+      name: record.name,
+      instanceId: registryInstance,
+      root: record.root,
+      rootExists,
+      distribution: record.instance?.distribution,
+      readCompatible: REGISTRY_BINDING.readCompatible(record.instance?.distribution),
+      staleIdentity: REGISTRY_BINDING.isStale(record.instance?.distribution),
+      desktop: { capability, launcher: paths.desktop, launcherExists },
+      safeToUnregister,
+      checks: entryChecks,
+    });
+    for (const row of entryChecks) checks.push({ ...row, id: `${record.name}/${row.id}` });
+  }
+
+  const errors = checks.filter(row => row.status === 'error').length;
+  const warnings = checks.filter(row => row.status === 'warn').length;
+  return {
+    scope: 'registry',
+    registry: home,
+    registryPath: path,
+    revision: registry.revision,
+    environments: entries.length,
+    entries,
+    ok: errors === 0,
+    summary: { errors, warnings, checks: checks.length },
+    checks,
   };
 }
 
@@ -1174,15 +2019,22 @@ export function pluginArguments({ args, storeDir }) {
  * copies", and only a read-back can say which one moved.
  */
 export function profileInstalledPackages(paths, profile) {
+  return profileInstalledPackagesReport(paths, profile).packages;
+}
+
+/**
+ * The same read-back, with the reason a profile's declarations are unavailable.
+ *
+ * The array-returning shape above is preserved because callers print it; this
+ * one carries `manifest`, a graded damage report, so `dpx env doctor` can say
+ * "profile manifest 损坏：<path>" instead of reporting an empty package list.
+ */
+export function profileInstalledPackagesReport(paths, profile) {
   const directory = profileDirectory(paths, profile);
-  let dependencies;
-  try {
-    const raw = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
-    dependencies = Object.keys(raw?.dependencies ?? {});
-  } catch {
-    return [];
-  }
-  return dependencies.map(packageName => {
+  const manifest = readJsonDocument(join(directory, 'package.json'), { domain: 'derived' });
+  if (!manifest.ok) return { profile, directory, packages: [], manifest };
+  const dependencies = Object.keys(manifest.value?.dependencies ?? {});
+  const packages = dependencies.map(packageName => {
     const installed = join(directory, 'node_modules', ...packageName.split('/'));
     const version = existsSync(installed) ? packageVersionAt(installed) : undefined;
     const globalPackage = locatePackage(paths, packageName);
@@ -1194,6 +2046,126 @@ export function profileInstalledPackages(paths, profile) {
       ...(version === undefined || globalVersion === undefined ? {} : { match: version === globalVersion }),
     };
   });
+  return { profile, directory, packages, manifest };
+}
+
+// ---------------------------------------------------------------------------
+// Desktop update journal (`<env-root>/desktop-state/updates.jsonl`) — read side
+// ---------------------------------------------------------------------------
+//
+// The desktop shell owns this file and appends one JSON object per line:
+//
+//   { schemaVersion, time, action, fromVersion, toVersion, sha256, result }
+//
+// dpx only ever *reads* it, and reads it tolerantly in exactly one direction:
+// a bad line is skipped and reported; a line whose `schemaVersion` this build
+// does not know is **rejected**, never guessed at — "格式不许静默演进" is what
+// keeps an unknown future journal from being misread as this one.
+
+/** Journal schema versions this build understands. A future one must be added deliberately. */
+export const DESKTOP_UPDATE_JOURNAL_SCHEMA_VERSIONS = Object.freeze([1]);
+
+/** The update outcomes that count as success; anything else is reported as a failure. */
+const DESKTOP_UPDATE_SUCCESS_RESULTS = Object.freeze(['success', 'ok', 'updated', 'up-to-date']);
+
+/**
+ * Read `<env-root>/desktop-state/updates.jsonl`.
+ *
+ * Never throws and never creates anything: a missing file yields
+ * `{ records: [], problems: [], present: false }`, which is a valid answer for
+ * "this environment has never updated its launcher".
+ *
+ * @returns `{ path, present, schemaVersions, records, problems, last }` where
+ *   `last` is the newest readable record.
+ */
+export function readDesktopUpdateJournal(path = undefined) {
+  const resolved = path ?? pathsFor('.').updates;
+  const report = { path: resolved, present: false, schemaVersions: [], records: [], problems: [], last: undefined };
+  if (!existsSync(resolved)) return report;
+  report.present = true;
+  const read = readJsonDocument(resolved, { domain: 'derived' });
+  if (!read.ok) {
+    // A JSONL file is not one JSON document, so "cannot parse as JSON" is only
+    // damage when the *lines* are unusable — handled below. Anything else
+    // (unreadable, or not a regular file) is damage outright.
+    if (read.problem.code !== 'damaged') {
+      report.problems.push(read.problem);
+      return report;
+    }
+  }
+  let text = '';
+  try {
+    text = readFileSync(resolved, 'utf8');
+  } catch (error) {
+    report.problems.push({ code: 'unreadable', path: resolved, message: error.message });
+    return report;
+  }
+  const lines = text.split(/\r?\n/);
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let row;
+    try {
+      row = JSON.parse(trimmed);
+    } catch (error) {
+      report.problems.push({ code: 'damaged', path: `${resolved}:${index + 1}`, message: `不是有效 JSON（${error.message}）` });
+      return;
+    }
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      report.problems.push({ code: 'damaged', path: `${resolved}:${index + 1}`, message: '不是 JSON 对象' });
+      return;
+    }
+    const schemaVersion = Number(row.schemaVersion);
+    if (!DESKTOP_UPDATE_JOURNAL_SCHEMA_VERSIONS.includes(schemaVersion)) {
+      report.problems.push({
+        code: 'damaged',
+        path: `${resolved}:${index + 1}`,
+        message: `未知 schemaVersion ${JSON.stringify(row.schemaVersion)}，本 dpx 只认 ${DESKTOP_UPDATE_JOURNAL_SCHEMA_VERSIONS.join(', ')}——拒绝按当前格式解读`,
+      });
+      return;
+    }
+    report.schemaVersions.push(schemaVersion);
+    const record = {
+      schemaVersion,
+      time: typeof row.time === 'string' ? row.time : undefined,
+      action: typeof row.action === 'string' ? row.action : undefined,
+      fromVersion: typeof row.fromVersion === 'string' ? row.fromVersion : undefined,
+      toVersion: typeof row.toVersion === 'string' ? row.toVersion : undefined,
+      sha256: normalizeHash(row.sha256),
+      result: typeof row.result === 'string' ? row.result : undefined,
+    };
+    report.records.push(record);
+    report.last = record;
+  });
+  return report;
+}
+
+function normalizeHash(value) {
+  if (typeof value !== 'string') return undefined;
+  const hex = value.trim().replace(/^sha256:/i, '').toLowerCase();
+  return /^[0-9a-f]{64}$/.test(hex) ? hex : undefined;
+}
+
+/**
+ * The one-line summary `dpx desktop status` attaches.
+ *
+ * `status` is one of `none` (no journal), `ok`, or `failed`, so a caller can
+ * gate on it without re-deriving the rules from `records`.
+ */
+export function desktopUpdateJournalSummary(journal) {
+  if (!journal.present || (journal.records.length === 0 && journal.problems.length === 0)) {
+    return { status: 'none', path: journal.path, records: 0, problems: journal.problems.length };
+  }
+  const last = journal.last;
+  const failed = journal.records.filter(row => row.result !== undefined && !DESKTOP_UPDATE_SUCCESS_RESULTS.includes(row.result));
+  const status = journal.records.length === 0 || failed.length || journal.problems.length ? (failed.length ? 'failed' : 'unknown') : 'ok';
+  return {
+    status,
+    path: journal.path,
+    records: journal.records.length,
+    problems: journal.problems.length,
+    ...(last ? { last: { time: last.time, action: last.action, fromVersion: last.fromVersion, toVersion: last.toVersion, result: last.result } } : {}),
+  };
 }
 
 export function commandUsage() {
@@ -1201,10 +2173,13 @@ export function commandUsage() {
     `Create and install:\n  dpx npm install -g @deepseek-ai/dsh @deepseek-harness-tui/dsh-tui --test --D:\\DevEnvs\\Projects\n  dpx npm install -g @deepseek-ai/dsh --test --D:\\DevEnvs\\Projects --no-desktop\n\n` +
     `Reuse an environment:\n  dpx npm install -g @deepseek-harness-tui/dsh-tui --test\n  dpx run --test dsh-tui\n  dpx run --test dsh -- web --no-open\n  dpx exec --test -- npm ls -g --depth=0\n\n` +
     `Ask which copy you are about to use (never guesses, never runs it):\n  dpx which --test\n  dpx which --test dsh-tui\n  dpx env doctor --test\n\n` +
+    `Check every environment at once, without one:\n  dpx env doctor\n  dpx env doctor --json\n\n` +
     `Enter an environment in the current shell:\n  dpx env use --test --format powershell | Invoke-Expression\n  dpx env use --test --format cmd\n\n` +
     `Manage a profile's plugins with an explicit store:\n  dpx plugin add --test <package>[@version|tarball] --profile dsh-tui\n\n` +
+    `Recover a profile whose patch or bundles stopped it from booting (never parses the patch):\n  dpx env repair --test\n  dpx env repair --test --profile web --dry-run\n\n` +
     `Desktop launcher (Windows):\n  dpx desktop status --test\n  dpx desktop check  --test\n  dpx desktop update --test\n  dpx desktop install --test --source github:T-Auto/dsh-dpx\n\n` +
-    `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx env remove --test --purge\n  dpx descriptor --test\n\n` +
+    `Inspect:\n  dpx env list\n  dpx env show --test\n  dpx env remove --test --purge\n  dpx env remove --test --purge --dry-run\n  dpx descriptor --test\n\n` +
     `The --name selector and optional --absolute-storage-root may appear anywhere in dpx npm arguments. New Windows environments receive a desktop EXE unless --no-desktop is supplied.\n` +
-    `dpx desktop updates only the desktop launcher, from GitHub Releases by default; --source also accepts an https manifest URL or a local manifest path.`;
+    `dpx desktop updates only the desktop launcher, from GitHub Releases by default; --source also accepts an https manifest URL or a local manifest path.\n` +
+    `--dry-run prints what would change and writes nothing; it is supported by dpx env remove and dpx env repair.`;
 }

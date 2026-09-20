@@ -31,6 +31,27 @@ export const GUIDE_FILE_NAME = 'AGENTS.md';
 export const GUIDE_BEGIN_PREFIX = '<!-- dpx:environment-guide:begin';
 export const GUIDE_END = '<!-- dpx:environment-guide:end -->';
 export const GUIDE_FORMAT = 2;
+
+/**
+ * Guide formats dpx has written, and what "readable" means for this file.
+ *
+ * A managed block is identified by its **marker form**, not by the body text
+ * (see `managedGuideRegion`), so *every* `v<digits>` this project has ever
+ * stamped is readable and upgradable in place. The list is documentation plus
+ * the contract a future format bump must extend; it is deliberately not used as
+ * an equality gate on the body, because that would freeze the upgrade of any
+ * block whose text differs by a single byte from a historical rendering.
+ *
+ * `GUIDE_FORMAT` is the format this build *writes*.
+ */
+export const GUIDE_WRITTEN_FORMATS = Object.freeze([1, 2]);
+export const GUIDE_READABLE_FORMATS = GUIDE_WRITTEN_FORMATS;
+
+/**
+ * The begin line of the version this build writes, e.g.
+ * `<!-- dpx:environment-guide:begin v2 -->`.
+ */
+export const GUIDE_BEGIN = `${GUIDE_BEGIN_PREFIX} v${GUIDE_FORMAT} -->`;
 /**
  * The environment's own identity record, written into the environment root.
  *
@@ -47,12 +68,19 @@ export function environmentGuidePath(paths) {
 /**
  * Render the managed block. It is generated from the environment's own layout,
  * so the absolute paths inside it are always the ones actually in use.
+ *
+ * `stamp` is the *exact* text a migrated block already carried after `v<format>`
+ * (` dsh-dpx@0.1.0` and friends). It is echoed verbatim when re-rendering the
+ * block a previous dpx wrote, which is what lets the byte-exact migration check
+ * accept a genuinely generated v1 block even though the version stamp is the
+ * one dpx had at the time.
  */
-export function renderEnvironmentGuide(paths, { name, version } = {}) {
+export function renderEnvironmentGuide(paths, { name, version, stamp } = {}) {
   const name_ = name ?? '<name>';
   const prefix = paths.npmPrefix;
   const cache = paths.npmCache;
-  const begin = `${GUIDE_BEGIN_PREFIX} v${GUIDE_FORMAT} dsh-dpx@${version ?? '0'} -->`;
+  const suffix = stamp ?? (version === undefined ? '' : ` dsh-dpx@${version}`);
+  const begin = `${GUIDE_BEGIN_PREFIX} v${GUIDE_FORMAT}${suffix} -->`;
   return `${begin}
 # 运行环境：dsh-dpx 隔离环境 \`${name_}\`
 
@@ -212,18 +240,79 @@ dsh-dpx 不劫持 npm：\`dpx run\`、\`dpx exec\` 与桌面启动器都不设�
 ${GUIDE_END}`;
 }
 
+
 /**
- * Merge a freshly rendered block into an existing instruction file:
- * replace the managed region in place, or append it to user content.
+ * Locate the managed region of an instruction file.
+ *
+ * The markers are not a hint, they are the ownership claim: a block that opens
+ * with `<!-- dpx:environment-guide:begin v<N> ... -->` and closes with the end
+ * marker is dpx's own generated region, whatever text it currently holds.
+ * dpx wrote v1 before v2, and a user may have edited the *inside* of the block
+ * (or an older dpx may have rendered it with a different version stamp), and
+ * neither of those makes the region someone else's: refusing to refresh it would
+ * freeze the upgrade forever, which is the failure mode the byte-exact reading
+ * of "known old format" produces.
+ *
+ * So the judgement is about *form*, not about the body:
+ *
+ * - `recognized: true`  — both markers present, BEGIN line matches
+ *   `dpx:environment-guide:begin v<digits>` → safe to replace in place;
+ * - `recognized: false` — the file mentions the markers but they are not a
+ *   well-formed dpx block (BEGIN line without a version number, a missing or
+ *   misplaced END, or an END before BEGIN) → **never** rewritten, only
+ *   reported, because that shape is not something dpx produces.
+ *
+ * @returns `{ begin, end, beginLine, format, stamp, body, recognized, reason }`
+ *   or undefined when the file has no managed region at all.
+ */
+export function managedGuideRegion(existing) {
+  const begin = existing.indexOf(GUIDE_BEGIN_PREFIX);
+  if (begin < 0) {
+    const stray = existing.indexOf(GUIDE_END);
+    if (stray < 0) return undefined;
+    return { begin: stray, end: stray, beginLine: '', format: undefined, stamp: undefined, body: '', recognized: false, reason: 'missing-begin' };
+  }
+  const end = existing.indexOf(GUIDE_END);
+  if (end <= begin) {
+    return { begin, end: existing.length, beginLine: '', format: undefined, stamp: undefined, body: '', recognized: false, reason: 'missing-end' };
+  }
+  const lineEnd = existing.indexOf('\n', begin);
+  const beginLine = (lineEnd < 0 ? existing.slice(begin) : existing.slice(begin, lineEnd)).replace(/\r$/, '');
+  const marker = /^<!-- dpx:environment-guide:begin v(\d+)([\s\S]*?) -->$/.exec(beginLine);
+  return {
+    begin,
+    end,
+    beginLine,
+    format: marker ? Number(marker[1]) : undefined,
+    stamp: marker ? marker[2] : undefined,
+    body: existing.slice(begin + beginLine.length + (lineEnd < 0 ? 0 : 1), end),
+    recognized: Boolean(marker),
+    reason: marker ? undefined : 'malformed-begin',
+  };
+}
+
+/**
+ * Merge a freshly rendered block into an existing instruction file.
+ *
+ * Three outcomes, in this order:
+ *
+ * 1. no managed region → the block is appended, user content stays above it;
+ * 2. a **recognized** managed region → replaced in place. This covers the
+ *    current format (idempotent refresh) and every older format dpx wrote
+ *    (the v1→v2 upgrade), because the markers are the ownership evidence;
+ * 3. a region that *looks* like an attempt at the markers but is not a
+ *    well-formed dpx block → returned unchanged. Rewriting it would destroy
+ *    hand-written text that merely reused the comment text.
  */
 export function mergeEnvironmentGuide(existing, block) {
-  const begin = existing.indexOf(GUIDE_BEGIN_PREFIX);
-  const end = existing.indexOf(GUIDE_END);
-  if (begin >= 0 && end > begin) {
-    return `${existing.slice(0, begin)}${block}${existing.slice(end + GUIDE_END.length)}`;
+  const region = managedGuideRegion(existing);
+  if (!region) {
+    if (existing.trim()) return `${existing.replace(/\s+$/, '')}\n\n${block}\n`;
+    return `${block}\n`;
   }
-  if (existing.trim()) return `${existing.replace(/\s+$/, '')}\n\n${block}\n`;
-  return `${block}\n`;
+  if (!region.recognized) return existing;
+  const regionEnd = region.end + GUIDE_END.length;
+  return `${existing.slice(0, region.begin)}${block}${existing.slice(regionEnd)}`;
 }
 
 /**
@@ -231,6 +320,15 @@ export function mergeEnvironmentGuide(existing, block) {
  *
  * Idempotent: the file is only rewritten when its managed block actually
  * changed, and any instructions a user wrote outside the markers are preserved.
+ *
+ * One refusal is deliberate and reported rather than papered over: a file whose
+ * markers are *not* a well-formed dpx block is left byte-for-byte alone
+ * (`migration.skipped === 'unrecognized-block'`). The operator gets the two
+ * commands that resolve it instead of a silently rewritten file.
+ *
+ * @returns `{ path, changed, format, blockFormat, migration? }` where
+ *   `migration.from` is the format the file carried (undefined when the block's
+ *   BEGIN line was malformed) and `migration.to` is `GUIDE_FORMAT`.
  */
 export async function ensureEnvironmentGuide(paths, info = {}) {
   const path = environmentGuidePath(paths);
@@ -243,9 +341,38 @@ export async function ensureEnvironmentGuide(paths, info = {}) {
       if (error?.code !== 'ENOENT') throw error;
     }
   }
+  const region = existing ? managedGuideRegion(existing) : undefined;
   const next = mergeEnvironmentGuide(existing, block);
-  if (next.replace(/\s+$/, '') === existing.replace(/\s+$/, '')) return { path, changed: false };
+  if (next === existing) {
+    return {
+      path,
+      changed: false,
+      format: GUIDE_FORMAT,
+      blockFormat: region?.format,
+      migration: region && !region.recognized
+        ? {
+          needed: true,
+          skipped: 'unrecognized-block',
+          from: region.format,
+          to: GUIDE_FORMAT,
+          reason: region.reason,
+          guidance: `dpx 没有改写 ${path}：文件里出现了 ${GUIDE_BEGIN_PREFIX} / ${GUIDE_END}，但它们不构成一个完整的 dpx 托管块`
+            + `（原因：${region.reason}）。这段因此被当作你手写的内容保留。`
+            + `要恢复自动刷新，请把 ${GUIDE_BEGIN_PREFIX} 起始行改成 dpx 的完整形态（例如 ${GUIDE_BEGIN}），`
+            + `或删掉/改名整段后再跑一次 dpx env doctor --${info.name ?? '<name>'}；不想丢内容就先备份该文件。`,
+        }
+        : undefined,
+    };
+  }
   await mkdir(paths.dshHome, { recursive: true });
   await writeFile(path, next, { encoding: 'utf8' });
-  return { path, changed: true };
+  return {
+    path,
+    changed: true,
+    format: GUIDE_FORMAT,
+    blockFormat: region?.format,
+    migration: region && region.format !== GUIDE_FORMAT
+      ? { needed: true, performed: true, from: region.format, to: GUIDE_FORMAT }
+      : undefined,
+  };
 }

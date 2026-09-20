@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import {
+  PLUGIN_COMPAT,
   SHELL_FORMATS,
   commandUsage,
   createEnvironment,
   defaultRegistryHome,
+  desktopUpdateJournalSummary,
   displayEnvironment,
   doctorReport,
+  environmentRemovalPlan,
   environmentShellScript,
   expectedPnpmStore,
   isGlobalInstall,
@@ -22,8 +25,11 @@ import {
   pluginArguments,
   profileDirectory,
   profileInstalledPackages,
+  readDesktopUpdateJournal,
   readProfileInstaller,
+  registryDoctorReport,
   removeEnvironment,
+  repairEnvironment,
   resolveCommandInPath,
   resolveEnvironment,
   runChild,
@@ -231,7 +237,7 @@ const DESKTOP_VERBS = new Set(['status', 'check', 'update', 'install']);
  * argument list so the environment selector parser keeps its single job.
  */
 function parseDesktopOptions(args) {
-  const options = { source: undefined, proxy: undefined, tag: undefined, prerelease: false, force: false, dryRun: false };
+  const options = { source: undefined, proxy: undefined, tag: undefined, apiBase: undefined, prerelease: false, force: false, dryRun: false };
   const rest = [];
   let index = 0;
   const readValue = (name, inline) => {
@@ -246,6 +252,9 @@ function parseDesktopOptions(args) {
     if (arg === '--source' || arg.startsWith('--source=')) { options.source = readValue('--source', arg.startsWith('--source=') ? arg.slice(9) : undefined); continue; }
     if (arg === '--proxy' || arg.startsWith('--proxy=')) { options.proxy = readValue('--proxy', arg.startsWith('--proxy=') ? arg.slice(8) : undefined); continue; }
     if (arg === '--tag' || arg.startsWith('--tag=')) { options.tag = readValue('--tag', arg.startsWith('--tag=') ? arg.slice(6) : undefined); continue; }
+    // GitHub REST base for the `--prerelease` lookup. Additive: `DPX_GITHUB_API`
+    // reaches the same code path, and the default stays api.github.com.
+    if (arg === '--api-base' || arg.startsWith('--api-base=')) { options.apiBase = readValue('--api-base', arg.startsWith('--api-base=') ? arg.slice('--api-base='.length) : undefined); continue; }
     if (arg === '--prerelease') { options.prerelease = true; continue; }
     if (arg === '--force') { options.force = true; continue; }
     if (arg === '--dry-run') { options.dryRun = true; continue; }
@@ -320,7 +329,7 @@ function parseUseOptions(args) {
 async function desktopCommand(args, home, environment) {
   const [verb, ...rest] = args;
   if (!DESKTOP_VERBS.has(verb)) {
-    throw new Error('Use `dpx desktop status|check|update|install --<name> [--source <github[:owner/repo][@tag]>|https://清单URL|本地清单路径] [--proxy <url>] [--tag <tag>] [--prerelease] [--force] [--dry-run]`.');
+    throw new Error('Use `dpx desktop status|check|update|install --<name> [--source <github[:owner/repo][@tag]>|https://清单URL|本地清单路径] [--proxy <url>] [--tag <tag>] [--prerelease] [--api-base <github-api-base>] [--force] [--dry-run]`.');
   }
   const { options, rest: selectors } = parseDesktopOptions(rest);
   const parsed = parseEnvironmentArguments(selectors, { parseDesktop: false });
@@ -330,7 +339,10 @@ async function desktopCommand(args, home, environment) {
   const record = await resolveEnvironment(parsed.name, home);
   const envRoot = record.root;
   if (verb === 'status') {
-    console.log(JSON.stringify({ environment: record.name, ...(await desktopStatus(envRoot)) }, null, 2));
+    // The update journal is read-only evidence, so the status report can carry
+    // it without changing the existing shape (`present` / `version` / … stay).
+    const journal = desktopUpdateJournalSummary(readDesktopUpdateJournal(pathsFor(envRoot).updates));
+    console.log(JSON.stringify({ environment: record.name, ...(await desktopStatus(envRoot)), updates: journal }, null, 2));
     return 0;
   }
   const source = options.source?.trim()
@@ -338,7 +350,7 @@ async function desktopCommand(args, home, environment) {
     || DEFAULT_DESKTOP_SOURCE;
   parseDesktopSource(source);
   if (verb === 'check') {
-    const result = await checkDesktopUpdate({ envRoot, source, proxy: options.proxy, prerelease: options.prerelease, tag: options.tag, env: environment });
+    const result = await checkDesktopUpdate({ envRoot, source, proxy: options.proxy, prerelease: options.prerelease, tag: options.tag, apiBase: options.apiBase, env: environment });
     console.log(JSON.stringify({ environment: record.name, ...result }, null, 2));
     return 0;
   }
@@ -348,6 +360,7 @@ async function desktopCommand(args, home, environment) {
     proxy: options.proxy,
     prerelease: options.prerelease,
     tag: options.tag,
+    apiBase: options.apiBase,
     force: options.force || verb === 'install',
     dryRun: options.dryRun,
     env: environment,
@@ -361,15 +374,34 @@ async function desktopCommand(args, home, environment) {
     installed: result.stamp ? { version: result.stamp.version, sha256: result.sha256, source: result.stamp.source } : undefined,
     previous: result.current ? { version: result.current.version, digest: result.current.digest } : undefined,
     release: result.release ? { version: result.release.version, tag: result.release.tag, assetName: result.release.assetName, source: result.release.source } : undefined,
-    message: result.updated
-      ? `desktop 封装已更新到 ${result.release.version}：${result.target}`
-      : result.reason === 'up-to-date'
-        ? `已是最新版本（${result.release.version}），无需更新。`
-        : result.reason === 'dry-run'
-          ? `将更新到 ${result.release.version}（--dry-run 未写入任何文件）。`
-          : `未更新：${result.reason}`,
+    message: desktopUpdateMessage(result),
   }, null, 2));
   return 0;
+}
+
+/**
+ * One line explaining an update outcome.
+ *
+ * Every `reason` the release channel can return gets its own sentence, because
+ * `未更新：newer-installed` tells an operator nothing about whether that is
+ * expected, a refusal, or an escape hatch.
+ */
+function desktopUpdateMessage(result) {
+  if (result.updated) return `desktop 封装已更新到 ${result.release.version}：${result.target}`;
+  switch (result.reason) {
+    case 'up-to-date':
+      return `已是最新版本（${result.release.version}），无需更新。`;
+    case 'newer-installed':
+      return `本地启动器版本（${result.current?.version ?? '未知'}）比发布源上的 ${result.release.version} 更新，已拒绝降级；`
+        + '确实要装旧版请显式加 --force 或改用 dpx desktop install。';
+    case 'different-build':
+      return `本地与发布源同版本（${result.release.version}）但字节不同（本地 sha256=${result.current?.digest ?? '未知'}，`
+        + `发布 sha256=${result.release.sha256 ?? '未知'}），未自动替换；确认要覆盖时加 --force。`;
+    case 'dry-run':
+      return `将更新到 ${result.release.version}（--dry-run 未写入任何文件）。`;
+    default:
+      return `未更新：${result.reason}`;
+  }
 }
 
 async function environmentCommand(args, home, environment) {
@@ -386,8 +418,30 @@ async function environmentCommand(args, home, environment) {
     return 0;
   }
   if (verb === 'doctor') {
-    const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
-    if (parsed.passthrough.length) throw new Error('env doctor accepts only an environment selector.');
+    // Registry scope is decided *before* `parseEnvironmentArguments`, for two
+    // reasons that both have to be handled here:
+    //
+    //   * `parseEnvironmentArguments([])` throws `An environment name is
+    //     required` — the parser demands a selector, so "no selector means
+    //     registry scope" cannot be expressed as a post-parse check;
+    //   * a bare `--json` is a perfectly valid environment selector to that
+    //     parser (`'json'` matches ENVIRONMENT_NAME) and would otherwise be read
+    //     as "the environment named json".
+    //
+    // Scope, not shape, is what the selector count selects:
+    //   0 selectors  → registry-level report (JSON by default and by contract)
+    //   1 selector   → single-environment report (always JSON, unchanged)
+    // Explicitly naming `--json` as an environment is impossible; a registry
+    // holdout can be reached with `dpx env show --json`.
+    const wantsJson = rest.includes('--json');
+    const selectors = rest.filter(arg => arg !== '--json');
+    if (selectors.length === 0) {
+      const report = await registryDoctorReport({ home, env: environment });
+      console.log(JSON.stringify({ json: true, ...report }, null, 2));
+      return report.ok ? 0 : 1;
+    }
+    const parsed = parseEnvironmentArguments(selectors, { parseDesktop: false });
+    if (parsed.passthrough.length) throw new Error('env doctor accepts only an environment selector and --json.');
     const record = await resolveEnvironment(parsed.name, home);
     const registry = await loadRegistry(home);
     const report = doctorReport({
@@ -398,7 +452,7 @@ async function environmentCommand(args, home, environment) {
       registry,
       registryHome: home,
     });
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ json: wantsJson, scope: 'environment', ...report }, null, 2));
     return report.ok ? 0 : 1;
   }
   if (verb === 'use') {
@@ -417,20 +471,92 @@ async function environmentCommand(args, home, environment) {
   if (verb === 'remove') {
     const parsed = parseEnvironmentArguments(rest, { parseDesktop: false });
     const purge = parsed.passthrough.includes('--purge');
-    const extras = parsed.passthrough.filter(arg => arg !== '--purge');
-    if (extras.length) throw new Error('env remove accepts only an environment selector and optional --purge.');
+    // `--dry-run` prints the exact plan (root, registry record, discovery
+    // pointer, desktop state) and writes nothing. It deliberately does not go
+    // through `resolveEnvironment`: that helper repairs the environment
+    // scaffold on the way, which would make a preview write files.
+    const dryRun = parsed.passthrough.includes('--dry-run');
+    const extras = parsed.passthrough.filter(arg => arg !== '--purge' && arg !== '--dry-run');
+    if (extras.length) throw new Error('env remove accepts only an environment selector and optional --purge / --dry-run.');
+    if (dryRun) {
+      const plan = await environmentRemovalPlan({ name: parsed.name, home, purge });
+      console.log(JSON.stringify({
+        dryRun: true,
+        environment: plan.name,
+        wouldRemove: {
+          registry: plan.registry,
+          root: plan.root,
+          desktop: plan.desktop,
+          discovery: plan.discovery,
+        },
+        message: purge
+          ? `将删除环境根 ${plan.root.path}（含桌面端与 desktop-state）并从 registry 注销 --${plan.name}；--dry-run 未写入任何文件。`
+          : `将只从 registry 注销 --${plan.name}，环境目录 ${plan.root.path} 原样保留；--dry-run 未写入任何文件。`,
+      }, null, 2));
+      return 0;
+    }
     const removed = await removeEnvironment({ name: parsed.name, home, purge });
     console.log(JSON.stringify({ removed: removed.record.name, root: removed.record.root, purged: removed.purged }, null, 2));
     return 0;
   }
-  throw new Error('Use `dpx env list`, `dpx env show --name`, `dpx env doctor --name`, `dpx env use --name [--format powershell|cmd|json]`, or `dpx env remove --name [--purge]`.');
+  if (verb === 'repair') {
+    const { options, rest: selectors } = parseRepairOptions(rest);
+    const parsed = parseEnvironmentArguments(selectors, { parseDesktop: false });
+    if (parsed.passthrough.length) throw new Error('env repair accepts only an environment selector and optional --profile / --dry-run.');
+    const report = await repairEnvironment({
+      name: parsed.name,
+      home,
+      profiles: options.profile ? [options.profile] : undefined,
+      dryRun: options.dryRun,
+      registryHome: home,
+    });
+    console.log(JSON.stringify({
+      ...report,
+      message: options.dryRun
+        ? `--dry-run：将把每个 profile 的 ${'cordis.patch.yml'} 备份为 ${'cordis.patch.yml.bak-<毫秒时间戳>'}（冲突时追加序号），`
+          + '并把 bundles 收窄到上游内建集合；未写入任何文件。'
+        : `已修复 ${report.profiles.filter(row => row.repaired).length} 个 profile：patch 已备份（未解析），bundles 已收窄到上游内建集合，`
+          + '其余 manifest 字段与已装包/`node_modules` 全部保留。',
+    }, null, 2));
+    return report.profiles.some(row => row.repaired === false) ? 1 : 0;
+  }
+  throw new Error('Use `dpx env list`, `dpx env show --name`, `dpx env doctor [--name] [--json]`, `dpx env use --name [--format powershell|cmd|json]`, `dpx env repair --name [--profile <profile>] [--dry-run]`, or `dpx env remove --name [--purge] [--dry-run]`.');
+}
+
+/** Options that only `dpx env repair` accepts. */
+function parseRepairOptions(args) {
+  const options = { profile: undefined, dryRun: false };
+  const rest = [];
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--profile' || arg.startsWith('--profile=')) {
+      const inline = arg.startsWith('--profile=') ? arg.slice('--profile='.length) : undefined;
+      const value = inline ?? args[index + 1];
+      if (value === undefined || (inline === undefined && value.startsWith('--'))) throw new Error('--profile 需要一个值。');
+      if (inline === undefined) index += 1;
+      options.profile = value;
+      continue;
+    }
+    if (arg === '--dry-run') { options.dryRun = true; continue; }
+    rest.push(arg);
+  }
+  return { options, rest };
 }
 
 async function descriptorCommand(args, home) {
   const parsed = parseEnvironmentArguments(args, { parseDesktop: false });
   if (parsed.passthrough.length) throw new Error('descriptor accepts only an environment selector.');
   const record = await resolveEnvironment(parsed.name, home);
-  console.log(JSON.stringify({ descriptor: pathsFor(record.root).descriptor, instance: record.instance, discoverableEntry: record.discoverableEntry }, null, 2));
+  console.log(JSON.stringify({
+    descriptor: pathsFor(record.root).descriptor,
+    instance: record.instance,
+    discoverableEntry: record.discoverableEntry,
+    // The anchor travels here, not inside `dsh-distribution.json`: that
+    // descriptor's schema is `additionalProperties: false`, so an extra key
+    // there would be a protocol violation rather than an extension.
+    pluginCompat: PLUGIN_COMPAT,
+  }, null, 2));
   return 0;
 }
 
