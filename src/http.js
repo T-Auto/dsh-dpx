@@ -334,7 +334,17 @@ export async function httpGet(url, options = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await httpGetOnce(url, options);
+      const response = await httpGetOnce(url, options);
+      // A 5xx (or 408/425/429) from a CDN is as transient as a reset socket, so
+      // it consumes the same retry budget. The final attempt still returns the
+      // response, because callers inspect the status themselves.
+      if (attempt < retries && RETRYABLE_STATUS.has(response.status)) {
+        throw new HttpError(`GET ${response.url} failed with status ${response.status}.`, {
+          status: response.status,
+          url: response.url,
+        });
+      }
+      return response;
     } catch (error) {
       lastError = error;
       if (attempt === retries || !isRetryable(error)) throw error;
