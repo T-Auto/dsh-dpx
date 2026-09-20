@@ -14,6 +14,7 @@ import {
   DEFAULT_DESKTOP_SOURCE,
   checkDesktopUpdate,
   compareVersions,
+  desktopGithubApi,
   desktopLauncherPath,
   desktopStampPath,
   desktopStatus,
@@ -21,6 +22,7 @@ import {
   installBundledDesktopLauncher,
   normalizeManifest,
   parseDesktopSource,
+  resolveLatestPrereleaseTag,
   updateDesktopLauncher,
 } from '../src/desktop-release.js';
 import { httpGet, httpGetJson } from '../src/http.js';
@@ -422,5 +424,64 @@ test('an older release is never available and never replaces a newer launcher', 
     assert.equal(refused.updated, false);
     assert.equal(refused.reason, 'newer-installed');
     assert.deepEqual(await readFile(desktopLauncherPath(record.root)), newerBytes);
+  });
+});
+
+test('the newest prerelease tag is resolved through an injectable api base', async () => {
+  await withReleaseServer(async ({ base, routes }) => {
+    routes.set('/repos/T-Auto/dsh-dpx/releases', {
+      body: JSON.stringify([
+        { tag_name: 'desktop-v0.2.7' },
+        { tag_name: 'desktop-v0.3.0-rc.1' },
+        { tag_name: 'desktop-v0.3.0-rc.2' },
+        // Drafts are not published, and unrelated tags are not desktop releases.
+        { tag_name: 'desktop-v0.9.0', draft: true },
+        { tag_name: 'release-notes' },
+      ]),
+    });
+    assert.equal(await resolveLatestPrereleaseTag('T-Auto/dsh-dpx', { apiBase: base }), 'desktop-v0.3.0-rc.2');
+    // The query string is not part of the route key, so this counts API hits.
+    assert.equal(routes.get('/repos/T-Auto/dsh-dpx/releases').hits, 1);
+  });
+});
+
+test('the github api base is selectable by argument or environment', () => {
+  assert.equal(desktopGithubApi(undefined, {}), 'https://api.github.com');
+  assert.equal(desktopGithubApi(undefined, { DPX_GITHUB_API: 'http://127.0.0.1:9/api/' }), 'http://127.0.0.1:9/api');
+  assert.equal(desktopGithubApi('http://example.test/', { DPX_GITHUB_API: 'http://ignored.test' }), 'http://example.test');
+});
+
+test('dpx desktop install is the explicit door, while update refuses a downgrade', async () => {
+  await withReleaseServer(async ({ base, routes, asset }) => {
+    const work = await mkdtemp(join(tmpdir(), 'dpx-cli-'));
+    const storage = join(work, 'storage');
+    const registry = join(work, 'registry');
+    await createEnvironment({ name: 'test', storageRoot: storage, home: registry, publishDiscovery: false, desktop: false, platform: 'win32' });
+    const envRoot = join(storage, 'dsh-environments', 'test');
+    const older = Buffer.from(`older-launcher-${'o'.repeat(64)}`);
+    routes.set('/new.json', { body: JSON.stringify(manifest('0.2.5', { bytes: asset, assetUrl: 'new.exe' })) });
+    routes.set('/new.exe', { type: 'application/octet-stream', body: asset });
+    routes.set('/old.json', { body: JSON.stringify(manifest('0.2.1', { bytes: older, assetUrl: 'old.exe' })) });
+    routes.set('/old.exe', { type: 'application/octet-stream', body: older });
+    const common = { DPX_HOME: registry, DPX_DISABLE_DISCOVERY: '1' };
+
+    const installed = await runAsync(['desktop', 'install', '--test', '--source', `${base}/new.json`], common);
+    assert.equal(installed.status, 0, installed.stderr);
+    assert.equal(JSON.parse(installed.stdout).updated, true);
+
+    // `install` implies force, so it reinstalls even when nothing changed.
+    const again = await runAsync(['desktop', 'install', '--test', '--source', `${base}/new.json`], common);
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(JSON.parse(again.stdout).updated, true);
+
+    const refused = await runAsync(['desktop', 'update', '--test', '--source', `${base}/old.json`], common);
+    assert.equal(refused.status, 0, refused.stderr);
+    assert.equal(JSON.parse(refused.stdout).reason, 'newer-installed');
+    assert.deepEqual(await readFile(desktopLauncherPath(envRoot)), asset);
+
+    const forced = await runAsync(['desktop', 'install', '--test', '--source', `${base}/old.json`], common);
+    assert.equal(forced.status, 0, forced.stderr);
+    assert.equal(JSON.parse(forced.stdout).updated, true);
+    assert.deepEqual(await readFile(desktopLauncherPath(envRoot)), older);
   });
 });
