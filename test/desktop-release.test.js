@@ -77,6 +77,15 @@ async function withReleaseServer(run) {
       response.writeHead(404).end('not found');
       return;
     }
+    // Retry behaviour is only observable by counting requests per route.
+    route.hits = (route.hits ?? 0) + 1;
+    if (route.statusSequence?.length || route.status !== undefined) {
+      const status = route.statusSequence?.length ? route.statusSequence.shift() : route.status;
+      const body = route.body ?? `status ${status}`;
+      response.writeHead(status, { 'content-type': route.type ?? 'application/json', 'content-length': Buffer.byteLength(body) });
+      response.end(body);
+      return;
+    }
     if (route.redirect) {
       response.writeHead(302, { location: route.redirect }).end();
       return;
@@ -344,4 +353,28 @@ test('a newly created Windows environment carries a stamped desktop launcher', a
     else process.env.DPX_DESKTOP_ARTIFACT = previous;
     await rm(work, { recursive: true, force: true });
   }
+});
+
+test('a transient release-host failure is retried until it succeeds', async () => {
+  await withReleaseServer(async ({ base, routes }) => {
+    routes.set('/flaky.json', { statusSequence: [500, 502], body: JSON.stringify({ ok: true }) });
+    const payload = await httpGetJson(`${base}/flaky.json`, { retries: 3, retryDelayMs: 0 });
+    assert.equal(payload.ok, true);
+    // Two rejected attempts plus the one that succeeded.
+    assert.equal(routes.get('/flaky.json').hits, 3);
+  });
+});
+
+test('client errors are not retried, and the retry budget is bounded', async () => {
+  await withReleaseServer(async ({ base, routes }) => {
+    // 404 is a client error: it fails once, immediately.
+    routes.set('/missing.json', { status: 404, body: 'nope' });
+    await assert.rejects(httpGetJson(`${base}/missing.json`, { retries: 4, retryDelayMs: 0 }), error => error.status === 404);
+    assert.equal(routes.get('/missing.json').hits, 1);
+
+    // 503 is retryable, but only `retries` extra attempts are made.
+    routes.set('/down.json', { status: 503, body: 'down' });
+    await assert.rejects(httpGetJson(`${base}/down.json`, { retries: 2, retryDelayMs: 0 }), error => error.status === 503);
+    assert.equal(routes.get('/down.json').hits, 3);
+  });
 });
