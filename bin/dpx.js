@@ -43,7 +43,7 @@ import {
   parseDesktopSource,
   updateDesktopLauncher,
 } from '../src/desktop-release.js';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 async function main(argv = process.argv.slice(2), environment = process.env) {
   const [command, ...rest] = argv;
@@ -510,17 +510,58 @@ async function environmentCommand(args, home, environment) {
       dryRun: options.dryRun,
       registryHome: home,
     });
-    console.log(JSON.stringify({
-      ...report,
-      message: options.dryRun
-        ? `--dry-run：将把每个 profile 的 ${'cordis.patch.yml'} 备份为 ${'cordis.patch.yml.bak-<毫秒时间戳>'}（冲突时追加序号），`
-          + '并把 bundles 收窄到上游内建集合；未写入任何文件。'
-        : `已修复 ${report.profiles.filter(row => row.repaired).length} 个 profile：patch 已备份（未解析），bundles 已收窄到上游内建集合，`
-          + '其余 manifest 字段与已装包/`node_modules` 全部保留。',
-    }, null, 2));
+    console.log(JSON.stringify({ ...report, message: repairSummary(report) }, null, 2));
     return report.profiles.some(row => row.repaired === false) ? 1 : 0;
   }
   throw new Error('Use `dpx env list`, `dpx env show --name`, `dpx env doctor [--name] [--json]`, `dpx env use --name [--format powershell|cmd|json]`, `dpx env repair --name [--profile <profile>] [--dry-run]`, or `dpx env remove --name [--purge] [--dry-run]`.');
+}
+
+/**
+ * A one-line summary that claims only what actually ran.
+ *
+ * The fixed template this replaces said "patch 已备份 / bundles 已收窄" no matter
+ * what happened — including for a profile whose patch file did not exist and
+ * whose bundles already matched, and for a run that repaired nothing at all.
+ * The patch file name comes from the rows, so it follows upstream's
+ * `PROFILE_PATCH_FILENAME` instead of hardcoding it.
+ */
+function repairSummary(report) {
+  const would = report.dryRun;
+  const repaired = report.profiles.filter(row => row.repaired);
+  const skipped = report.profiles.filter(row => !row.repaired);
+  const backedUp = repaired.filter(row => row.patchExists);
+  const made = repaired.filter(row => row.created);
+  const parts = [];
+  if (repaired.length === 0) {
+    parts.push(would ? '没有需要处理的 profile' : '没有修复任何 profile');
+  } else {
+    parts.push(`${would ? '将修复' : '已修复'} ${repaired.length} 个 profile（${repaired.map(row => row.profile).join('、')}）`);
+    if (made.length) parts.push(`${would ? '将创建' : '已创建'} ${made.map(row => row.profile).join('、')}`);
+    if (backedUp.length) {
+      parts.push(`${would ? '将备份' : '已备份'} ${backedUp.length} 个 ${basename(backedUp[0].patchPath)}`
+        + `（${would ? '不' : '未'}解析内容，冲突时追加序号）`);
+    } else {
+      parts.push('没有 patch 文件需要备份');
+    }
+    // A row whose `changed` is false had nothing to narrow, and a created profile
+    // was never narrowed — it was born on the template. Claiming otherwise is the
+    // same defect this function replaced, one level down.
+    const narrowed = repaired.filter(row => row.changed && !row.created);
+    if (narrowed.length) {
+      parts.push(`${would ? '将把' : '已把'} ${narrowed.length} 个 profile 的 bundles 收窄到上游内建集合，`
+        + '其余 manifest 字段与已装包/`node_modules` 保留');
+    } else if (!made.length) {
+      parts.push('bundles 本就与上游内建集合一致，manifest 未被改写');
+    }
+  }
+  if (skipped.length) {
+    parts.push(`跳过 ${skipped.length} 个：${skipped.map(row => `${row.profile}（${row.reason}）`).join('、')}`);
+  }
+  if (report.ignored?.length) {
+    parts.push(`忽略 ${report.ignored.length} 个非 profile 目录：${report.ignored.map(row => row.profile).join('、')}`);
+  }
+  parts.push(would ? '未写入任何文件' : `registry 已标记为 ${report.registryStamped}`);
+  return `${parts.join('；')}。`;
 }
 
 /** Options that only `dpx env repair` accepts. */
@@ -533,7 +574,13 @@ function parseRepairOptions(args) {
     if (arg === '--profile' || arg.startsWith('--profile=')) {
       const inline = arg.startsWith('--profile=') ? arg.slice('--profile='.length) : undefined;
       const value = inline ?? args[index + 1];
-      if (value === undefined || (inline === undefined && value.startsWith('--'))) throw new Error('--profile 需要一个值。');
+      // An empty value is rejected rather than passed along: it is falsy at the
+      // call site, which silently downgrades a single-profile recovery into a
+      // whole-environment rewrite. `--profile "$VAR"` with VAR unset is the way
+      // this happens in practice.
+      if (value === undefined || value.trim() === '' || (inline === undefined && value.startsWith('--'))) {
+        throw new Error('--profile 需要一个非空的 profile 名。');
+      }
       if (inline === undefined) index += 1;
       options.profile = value;
       continue;

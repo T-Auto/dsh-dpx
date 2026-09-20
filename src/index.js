@@ -1326,6 +1326,12 @@ export async function probeAppBoot(paths) {
       patchFileName: module.PROFILE_PATCH_FILENAME,
       hasSanitizeProfile: typeof module.sanitizeProfile === 'function',
       hasWriteProfileBundles: typeof module.writeProfileBundles === 'function',
+      // Upstream's own profile initializer, used when a named profile has to be
+      // created. Creation does not write a manifest by hand for the same reason
+      // the bundle list is not copied: a local reimplementation of upstream's
+      // profile contract is a second thing to keep in sync, and the one it would
+      // write is the one nothing else reads.
+      initProfile: typeof module.initProfile === 'function' ? module.initProfile : undefined,
     };
   } catch (error) {
     return { available: false, reason: `import() 失败：${error.message}`, path: appBoot, templates: undefined };
@@ -1337,9 +1343,22 @@ export function profileTemplateNames(templates) {
   return Object.keys(templates ?? {}).sort();
 }
 
-function bundlesForProfile(templates, profile) {
-  const bundles = templates?.[profile]?.bundles;
-  return Array.isArray(bundles) && bundles.length ? [...bundles] : undefined;
+/**
+ * One upstream template, normalized across the shapes upstream has shipped.
+ *
+ * `@deepseek-ai/dsh-app-boot` changed this value's shape: through `0.1.1-rc.2` a
+ * template is a bare array of bundles, and from `0.1.2-alpha.2` it is an object
+ * carrying `bundles` and `patchReload`. Reading only the newer shape made every
+ * profile of an older environment look like it had no template at all — the
+ * list was right there, dpx just could not read it.
+ */
+function profileTemplate(templates, profile) {
+  const entry = templates?.[profile];
+  if (Array.isArray(entry)) return entry.length ? { bundles: [...entry], patchReload: undefined } : undefined;
+  const bundles = entry?.bundles;
+  return Array.isArray(bundles) && bundles.length
+    ? { bundles: [...bundles], patchReload: entry.patchReload }
+    : undefined;
 }
 
 /**
@@ -1377,16 +1396,25 @@ export async function repairProfileDirectory(profileDir, { bundles, patchFileNam
   record.bundlesBefore = Array.isArray(before) ? [...before] : undefined;
   record.changed = JSON.stringify(record.bundlesBefore ?? null) !== JSON.stringify(bundles);
   if (dryRun) return record;
-  if (patchExists) {
-    // rename, not copy: the patch must stop being loaded in the same step it is
-    // preserved, and dsh re-creates an empty one on the next boot.
-    await rename(patchPath, backupPath);
+  try {
+    if (patchExists) {
+      // rename, not copy: the patch must stop being loaded in the same step it is
+      // preserved, and dsh re-creates an empty one on the next boot.
+      await rename(patchPath, backupPath);
+    }
+    const updated = {
+      ...manifestReport.value,
+      dsh: { ...manifestReport.value.dsh, profile: { ...manifestReport.value.dsh?.profile, bundles: [...bundles] } },
+    };
+    await writeFile(manifestPath, `${JSON.stringify(updated, null, 2)}\n`, { encoding: 'utf8' });
+  } catch (error) {
+    // The patch is renamed before the manifest is written, so a failed write
+    // leaves the profile half-repaired. Carry what was actually done to disk so
+    // the caller reports the backup that exists rather than a bare error that
+    // hides it.
+    error.repairRecord = { ...record, bundlesAfter: undefined };
+    throw error;
   }
-  const updated = {
-    ...manifestReport.value,
-    dsh: { ...manifestReport.value.dsh, profile: { ...manifestReport.value.dsh?.profile, bundles: [...bundles] } },
-  };
-  await writeFile(manifestPath, `${JSON.stringify(updated, null, 2)}\n`, { encoding: 'utf8' });
   record.bundlesAfter = [...bundles];
   return record;
 }
@@ -1394,9 +1422,15 @@ export async function repairProfileDirectory(profileDir, { bundles, patchFileNam
 /**
  * Repair every profile of one environment.
  *
- * `profiles` defaults to every existing profile. A named profile that does not
+ * `profiles` defaults to every existing profile. A *named* profile that does not
  * exist yet is created from the upstream template when upstream has one, and is
- * refused otherwise — dpx will not invent a bundle list.
+ * refused otherwise — dpx will not invent a bundle list, and it will not create
+ * profiles nobody asked for.
+ *
+ * Only environment-level problems throw (unregistered environment, missing root,
+ * no usable app-boot to source templates from). A profile-level problem becomes a
+ * row with `repaired: false`, because one unrepairable profile must not stop the
+ * command from repairing the others — the exit code already speaks for the row.
  */
 export async function repairEnvironment({
   name,
@@ -1422,29 +1456,118 @@ export async function repairEnvironment({
   }
   const requested = profiles?.length ? profiles : undefined;
   const known = listProfiles(paths);
-  const targets = requested?.filter(profile => known.includes(profile))
-    ?? (known.length ? known : profileTemplateNames(probe.templates));
+  // A directory is not a profile until it has a manifest. Treating any directory
+  // as one is what made a crashed run's leftover empty directory permanent: it
+  // was picked up as a target and threw on every later run, so the environment
+  // could never be repaired again. Those directories are reported as `ignored`
+  // instead — informational, and deliberately not a failure.
+  const hasManifest = profile => existsSync(join(profileDirectory(paths, profile), 'package.json'));
+  // Without `--profile`, repair touches only profiles that already exist. It does
+  // not conjure every upstream template into an environment that has none: an
+  // environment with no profiles has nothing to repair, and creating five of them
+  // would be initialization, not recovery.
+  const targets = requested ?? known.filter(hasManifest);
+  const ignored = requested
+    ? []
+    : known.filter(profile => !hasManifest(profile))
+      .map(profile => ({ profile, profileDir: profileDirectory(paths, profile), reason: 'not-a-profile' }));
   const results = [];
   const created = [];
   for (const profile of targets) {
-    const bundles = bundlesForProfile(probe.templates, profile);
-    if (!bundles) {
+    const template = profileTemplate(probe.templates, profile);
+    if (!template) {
+      // Only names that actually resolve are offered: a template whose bundle
+      // list is empty is one this loop refuses, so listing it as available would
+      // have the message deny and assert the same thing in one sentence.
+      const usable = profileTemplateNames(probe.templates)
+        .filter(candidate => profileTemplate(probe.templates, candidate));
       results.push({
         profile,
         repaired: false,
         reason: 'no-upstream-template',
-        message: `上游 PROFILE_TEMPLATES 里没有 ${JSON.stringify(profile)} 的 bundle 集合；dpx 不猜。`
-          + `可用的 profile：${profileTemplateNames(probe.templates).join(', ') || '(none)'}`,
+        message: `上游 PROFILE_TEMPLATES 里没有 ${JSON.stringify(profile)}，dpx 不猜它的 bundle 集合。`
+          + `上游提供模板的 profile：${usable.join(', ') || '(none)'}`,
       });
       continue;
     }
     const directory = profileDirectory(paths, profile);
-    if (!existsSync(directory)) {
-      if (requested) created.push(profile);
-      if (!dryRun) await mkdir(directory, { recursive: true });
+    const patchPath = join(directory, probe.patchFileName ?? 'cordis.patch.yml');
+    const existed = existsSync(directory);
+    if (!hasManifest(profile)) {
+      // Only an explicitly named profile reaches here (auto-discovery skips any
+      // name without a manifest). `initProfile` never touches a file that
+      // already exists, so naming a directory an older dpx left behind fills it
+      // in rather than refusing it.
+      if (typeof probe.initProfile !== 'function') {
+        results.push({
+          profile,
+          repaired: false,
+          reason: 'cannot-create',
+          message: `环境内嵌套的 ${probe.path ?? '@deepseek-ai/dsh-app-boot'} 未导出 initProfile，dpx 不手写第二份 profile 契约；`
+            + `请先升级环境内的 ${PLUGIN_COMPAT.anchorPackage}：dpx npm install -g ${PLUGIN_COMPAT.anchorPackage}@latest --${name}`,
+        });
+        continue;
+      }
+      created.push(profile);
+      const row = {
+        profile,
+        repaired: true,
+        created: true,
+        profileDir: directory,
+        patchPath,
+        manifestPath: join(directory, 'package.json'),
+        bundles: template.bundles,
+        bundlesBefore: undefined,
+        bundlesAfter: template.bundles,
+        changed: true,
+      };
+      if (dryRun) {
+        // Nothing is written, so a patch file already sitting there is the only
+        // signal that the real run would move one aside.
+        results.push({ ...row, patchExists: existsSync(patchPath) });
+        continue;
+      }
+      try {
+        probe.initProfile(directory, template.bundles, template.patchReload);
+      } catch (error) {
+        // Same contract as the repair below: a profile-level failure is a row,
+        // not an exception that takes the whole command with it.
+        created.pop();
+        results.push({ profile, repaired: false, reason: 'cannot-create', message: error.message });
+        continue;
+      }
+      if (!existed) {
+        // Nothing was here before, so there is nothing to move aside.
+        results.push({ ...row, patchExists: false });
+        continue;
+      }
+      // The directory existed without a manifest. `initProfile` filled the
+      // manifest in, but whatever else is in there — including a patch that may
+      // be exactly what stopped the profile booting — is still the user's, so
+      // fall through to the normal repair rather than calling it healthy.
     }
-    const repair = await repairProfileDirectory(directory, { bundles, patchFileName: probe.patchFileName ?? 'cordis.patch.yml', dryRun, timestamp });
-    results.push({ profile, repaired: true, created: !existsSync(join(directory, 'package.json')), ...repair });
+    try {
+      const repair = await repairProfileDirectory(directory, {
+        bundles: template.bundles,
+        patchFileName: probe.patchFileName ?? 'cordis.patch.yml',
+        dryRun,
+        timestamp,
+      });
+      results.push({ profile, repaired: true, created: created.includes(profile), ...repair });
+    } catch (error) {
+      // Reported, not thrown: the remaining profiles are still repairable, and
+      // `report.profiles.some(row => row.repaired === false)` already turns this
+      // row into a non-zero exit code. A failure that happened *after* the patch
+      // was moved aside carries the partial record, so the report names the
+      // backup file that exists instead of hiding it behind the error.
+      results.push({
+        ...(error.repairRecord ?? {}),
+        profile,
+        repaired: false,
+        reason: 'unrepairable',
+        message: error.message,
+      });
+    }
   }
   // Repair always stamps the current distribution identity: this is the one
   // place that legitimately rewrites a registry record, and "write always
@@ -1461,6 +1584,10 @@ export async function repairEnvironment({
     // profile manifest and writes a BOM-free manifest by construction — the two
     // failure modes this command exists to survive.
     capabilities: {
+      // The hard prerequisite for creating a profile that does not exist yet:
+      // a caller that wants to warn before trying reads this instead of having to
+      // infer it from a `cannot-create` row after the fact.
+      initProfile: typeof probe.initProfile === 'function' ? 'available-upstream' : 'absent-upstream',
       sanitizeProfile: probe.hasSanitizeProfile ? 'available-upstream' : 'absent-upstream',
       writeProfileBundles: probe.hasWriteProfileBundles ? 'available-upstream' : 'absent-upstream',
       implementation: 'local-equivalent',
@@ -1469,6 +1596,7 @@ export async function repairEnvironment({
         : '上游未导出 sanitizeProfile（它只在 dsh >= 0.1.6-alpha.2 源码里导出），使用本地等价实现',
     },
     created,
+    ignored,
     profiles: results,
   };
   if (!dryRun) {
