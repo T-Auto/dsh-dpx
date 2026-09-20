@@ -1,4 +1,4 @@
-# Verify the desktop launcher's window lifecycle against a real executable.
+﻿# Verify the desktop launcher's window lifecycle against a real executable.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\verify-desktop-shell-window.ps1 `
 #     -Launcher "assets\windows\DSH DeepSeek Harness Desktop.exe"
