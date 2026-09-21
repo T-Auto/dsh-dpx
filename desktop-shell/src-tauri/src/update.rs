@@ -415,6 +415,15 @@ pub fn installed_digest(env_root: &Path) -> Option<String> {
     Some(sha256_hex(&bytes))
 }
 
+/// The channel a settings record points at: its own source, else the default feed.
+///
+/// Three places read that field — a check, an install, and the record an applied
+/// install writes back — and one function keeps them naming the same feed, so the
+/// `source` in a stamped record always matches the channel it came from.
+pub fn effective_source(settings: &Settings) -> String {
+    settings.update_source.clone().unwrap_or_else(|| DEFAULT_SOURCE.to_string())
+}
+
 /// Check the channel for a newer desktop launcher. Network only, never writes.
 ///
 /// The only-upgrade rule is the same one `src/desktop-release.js` applies: an
@@ -422,7 +431,7 @@ pub fn installed_digest(env_root: &Path) -> Option<String> {
 /// only when its bytes differ (a republished build), which the settings window
 /// has to confirm explicitly before [`apply`] accepts it.
 pub fn check(env_root: &Path, settings: &Settings) -> LastCheck {
-    let source = settings.update_source.clone().unwrap_or_else(|| DEFAULT_SOURCE.to_string());
+    let source = effective_source(settings);
     let installed_version = read_installed_version(env_root);
     let digest = installed_digest(env_root);
     let mut result = LastCheck {
@@ -583,7 +592,7 @@ pub fn apply(env_root: &Path, settings: &Settings, force: bool) -> Result<ApplyO
 /// The install itself, with the record's `toVersion`/`sha256` filled in as soon
 /// as the manifest is known.
 fn apply_inner(env_root: &Path, settings: &Settings, force: bool, record: &mut ApplyRecord) -> Result<ApplyOutcome, String> {
-    let source = settings.update_source.clone().unwrap_or_else(|| DEFAULT_SOURCE.to_string());
+    let source = effective_source(settings);
     let parsed = parse_source(&source)?;
     let proxy = effective_proxy(settings);
     let manifest = match fetch_manifest(&parsed, proxy.as_deref()) {

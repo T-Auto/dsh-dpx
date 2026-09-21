@@ -63,6 +63,10 @@
       const invoke = window.__TAURI__.core.invoke;
       const $ = id => document.getElementById(id);
       let settings = null;
+      // The installed launcher's version, as the shell reports it. The check record
+      // is compared against that same stamp, so both halves of the line below name
+      // the same thing.
+      let liveVersion = '';
       // The shell refuses two things without an explicit acknowledgement: a
       // republished build of the version that is already installed (same version,
       // different bytes) and replacing the launcher while this environment's DSH
@@ -90,18 +94,26 @@
         $('update-proxy').value = settings.updateProxy ?? '';
       }
 
-      function describeCheck(check) {
+      // A recorded check is history the moment the launcher it describes is
+      // replaced — an in-app update, `dpx desktop update`, the self-update script.
+      // The shell re-stamps such a record (`reason: 'stale'`) and clears
+      // `available` with it, so this only has to name it honestly: "当时" for the
+      // version the check saw, and what is installed now.
+      function describeCheck(check, live) {
         if (!check) return '尚未检查过更新。';
         const when = check.atMillis ? new Date(check.atMillis).toLocaleString() : '';
+        const stale = check.reason === 'stale';
         const parts = [];
-        if (check.installedVersion) parts.push(`当前 ${check.installedVersion}`);
+        if (check.installedVersion) parts.push(`${stale ? '当时' : '当前'} ${check.installedVersion}`);
         if (check.latestVersion) parts.push(`发布源 ${check.latestVersion}`);
+        if (stale && live && live !== check.installedVersion) parts.push(`本机已安装 ${live}`);
         return [`[${when}] ${check.message ?? check.reason}`, parts.join('　·　')].filter(Boolean).join('\n');
       }
 
       async function refresh() {
         const info = await invoke('desktop_info');
         settings = await invoke('get_settings');
+        liveVersion = info.launcherVersion ?? info.shellVersion;
         $('subtitle').textContent = `隔离环境 ${info.environment}　·　启动器 ${info.launcherPresent ? '已安装' : '不存在'}`;
         $('shell-version').textContent = info.shellVersion + (info.launcherVersion && info.launcherVersion !== info.shellVersion ? `（文件记录 ${info.launcherVersion}）` : '');
         $('environment').textContent = info.environment;
@@ -114,7 +126,7 @@
         $('dsh-args').textContent = info.dsh ? `${info.dsh.args.join(' ')}` : '—';
         $('log-hint').textContent = `日志：${info.logPath}`;
         syncForm();
-        showStatus($('update-status'), describeCheck(settings.lastCheck), settings.lastCheck?.available ? 'ok' : '');
+        showStatus($('update-status'), describeCheck(settings.lastCheck, liveVersion), settings.lastCheck?.available ? 'ok' : '');
         forceAcknowledged = false;
         runningAcknowledged = false;
         $('apply-update').disabled = !settings.lastCheck?.available;
@@ -143,7 +155,7 @@
           settings.lastCheck = result;
           forceAcknowledged = false;
           runningAcknowledged = false;
-          showStatus($('update-status'), describeCheck(result), result.available ? 'ok' : '');
+          showStatus($('update-status'), describeCheck(result, liveVersion), result.available ? 'ok' : '');
           $('apply-update').disabled = !result.available;
           $('apply-update').textContent = needsForce(result) ? '强制更新' : '立即更新';
         } catch (error) {

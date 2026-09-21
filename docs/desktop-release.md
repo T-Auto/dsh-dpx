@@ -191,3 +191,21 @@ Stale files from earlier updates are cleaned from
 
 The install stamp is written by two programs: `dpx` writes the ISO `installedAt`, the shell writes the epoch `installedAtMillis`, and readers accept both shapes — the stamp now carries both fields so neither side loses the install time it does not write itself.
 Its `schemaVersion` is validated against `DESKTOP_STAMP_SCHEMA_VERSIONS` (`[1]`) instead of being accepted silently; a stamp outside that list is reported as damaged (`stampDamaged`, `stampReason`, `stampMessage`) rather than read as if it were version 1, and a damaged stamp never blocks an update.
+
+## The settings window's check record
+
+`desktop-state/settings.json` keeps the last check as a snapshot, and its
+`installedVersion` is the launcher that was on disk when that check ran. The
+launcher can be replaced without this window ever seeing it — `dpx desktop update`,
+the self-update script, or the window's own update button followed by the restart —
+so the record is history the moment its version stops matching the installed one.
+
+`settings::freshen_last_check` is the display half of that: the copy handed to the
+window gets `available: false`, `reason: "stale"` and a message naming both
+versions, while the record on disk keeps the fields it observed (the window labels
+them "当时"). Clearing `available` is what keeps an expired result from arming the
+update button; the window only has to name it. The other half is
+`settings::LastCheck::after_apply`: a successful in-app update writes the record the
+way a check would, so the window that returns after the restart reports what it
+installed. `update::effective_source` is the single place that decides which feed a
+record's `source` names.

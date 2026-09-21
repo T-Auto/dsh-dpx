@@ -428,7 +428,9 @@ fn desktop_info(app: tauri::AppHandle) -> Result<DesktopInfo, String> {
 
 #[tauri::command]
 fn get_settings() -> Result<settings::Settings, String> {
-    Ok(settings::load(&env_root()?))
+    let root = env_root()?;
+    let installed = update::read_installed_version(&root);
+    Ok(settings::freshen_last_check(settings::load(&root), installed.as_deref()))
 }
 
 #[derive(Deserialize, Default)]
@@ -463,7 +465,11 @@ fn save_settings(app: tauri::AppHandle, patch: SettingsPatch) -> Result<settings
     }
     settings::save(&root, &current)?;
     tray::sync(&app, current.tray_enabled);
-    Ok(current)
+    // Saving an unrelated preference must not turn an expired check back into a
+    // current one, so the window gets the same re-stamped view `get_settings`
+    // hands out. What was written above is the record as it was recorded.
+    let installed = update::read_installed_version(&root);
+    Ok(settings::freshen_last_check(current, installed.as_deref()))
 }
 
 #[tauri::command]
@@ -518,8 +524,17 @@ async fn apply_desktop_update(
     }
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let root = env_root()?;
-        let current = settings::load(&root);
+        let mut current = settings::load(&root);
         let outcome = update::apply(&root, &current, force)?;
+        // The launcher the window's recorded check describes is the one that just
+        // went away, and this process is about to restart. Stamp the record with
+        // what was installed, so the window that comes back cannot show the old
+        // version next to the new one (the other half of that fix lives in
+        // `settings::freshen_last_check`, which covers updates applied elsewhere).
+        let source = update::effective_source(&current);
+        current.last_check =
+            Some(settings::LastCheck::after_apply(&outcome.version, source, settings::now_millis()));
+        let _ = settings::save(&root, &current);
         log_line(&root, &format!("desktop updated to {} ({})", outcome.version, outcome.launcher));
         Ok::<_, String>(outcome)
     })
