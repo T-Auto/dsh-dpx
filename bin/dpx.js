@@ -510,8 +510,17 @@ async function environmentCommand(args, home, environment) {
       dryRun: options.dryRun,
       registryHome: home,
     });
+    // Warnings explain what a run could only half-do; they never change the exit
+    // code, so they go to stderr and leave stdout as the JSON contract.
+    for (const warning of report.warnings ?? []) console.error(`[WARN] ${warning}`);
     console.log(JSON.stringify({ ...report, message: repairSummary(report) }, null, 2));
-    return report.profiles.some(row => row.repaired === false) ? 1 : 0;
+    // The exit code answers exactly one question: did this run leave something it
+    // was supposed to fix unfixed? A profile dpx deliberately left alone
+    // (`unchanged`), or a directory that is not a profile (`ignored`), is not that
+    // — a batch scan must not go red merely because a third-party profile exists.
+    // Naming a target it cannot act on (`failed`) is the case that fails. The rule
+    // travels in `report.ok` so it is not re-derived here or by any other caller.
+    return report.ok ? 0 : 1;
   }
   throw new Error('Use `dpx env list`, `dpx env show --name`, `dpx env doctor [--name] [--json]`, `dpx env use --name [--format powershell|cmd|json]`, `dpx env repair --name [--profile <profile>] [--dry-run]`, or `dpx env remove --name [--purge] [--dry-run]`.');
 }
@@ -521,41 +530,73 @@ async function environmentCommand(args, home, environment) {
  *
  * The fixed template this replaces said "patch 已备份 / bundles 已收窄" no matter
  * what happened — including for a profile whose patch file did not exist and
- * whose bundles already matched, and for a run that repaired nothing at all.
- * The patch file name comes from the rows, so it follows upstream's
+ * whose bundles already matched, and for a run that repaired nothing at all. The
+ * patch file name comes from the rows, so it follows upstream's
  * `PROFILE_PATCH_FILENAME` instead of hardcoding it.
+ *
+ * The three row kinds are named separately, because exactly one of them decides
+ * the exit code: `failed` is the only failure, `unchanged` is a profile that
+ * needed nothing (deliberately not a failure), and a profile dpx could only
+ * half-repair (`bundlesSource: 'untouched'`) is stated as such rather than
+ * reported as either.
  */
 function repairSummary(report) {
   const would = report.dryRun;
-  const repaired = report.profiles.filter(row => row.repaired);
-  const skipped = report.profiles.filter(row => !row.repaired);
-  const backedUp = repaired.filter(row => row.patchExists);
-  const made = repaired.filter(row => row.created);
+  const rows = report.profiles;
+  const repaired = rows.filter(row => row.kind === 'repaired');
+  const unchanged = rows.filter(row => row.kind === 'unchanged');
+  const failed = rows.filter(row => row.kind === 'failed');
+  const created = repaired.filter(row => row.created);
+  const backedUp = repaired.filter(row => row.backupPath);
+  const narrowed = repaired.filter(row => row.changed && !row.created);
+  const patchOnly = [...repaired, ...unchanged].filter(row => row.bundlesSource === 'untouched' && !row.created);
+  const matched = [...repaired, ...unchanged].filter(row => row.bundlesSource !== 'untouched' && !row.created);
   const parts = [];
   if (repaired.length === 0) {
     parts.push(would ? '没有需要处理的 profile' : '没有修复任何 profile');
   } else {
     parts.push(`${would ? '将修复' : '已修复'} ${repaired.length} 个 profile（${repaired.map(row => row.profile).join('、')}）`);
-    if (made.length) parts.push(`${would ? '将创建' : '已创建'} ${made.map(row => row.profile).join('、')}`);
+    if (created.length) parts.push(`${would ? '将创建' : '已创建'} ${created.map(row => row.profile).join('、')}`);
+    if (narrowed.length) {
+      parts.push(`${would ? '将把' : '已把'} ${narrowed.length} 个 profile 的 bundles 收窄到其 bundle 来源，`
+        + '其余 manifest 字段与已装包/`node_modules` 保留');
+    }
+  }
+  // Stated for any run that inspected profiles — including one that repaired
+  // nothing, where "the patch half had nothing to do" is exactly what an operator
+  // wants to hear. Empty layers are why this is a sentence and not a file count.
+  if (rows.length > 0) {
     if (backedUp.length) {
       parts.push(`${would ? '将备份' : '已备份'} ${backedUp.length} 个 ${basename(backedUp[0].patchPath)}`
         + `（${would ? '不' : '未'}解析内容，冲突时追加序号）`);
     } else {
       parts.push('没有 patch 文件需要备份');
     }
-    // A row whose `changed` is false had nothing to narrow, and a created profile
-    // was never narrowed — it was born on the template. Claiming otherwise is the
-    // same defect this function replaced, one level down.
-    const narrowed = repaired.filter(row => row.changed && !row.created);
-    if (narrowed.length) {
-      parts.push(`${would ? '将把' : '已把'} ${narrowed.length} 个 profile 的 bundles 收窄到上游内建集合，`
-        + '其余 manifest 字段与已装包/`node_modules` 保留');
-    } else if (!made.length) {
+  }
+  // A row whose `changed` is false had nothing to narrow, and a created profile was
+  // never narrowed — it was born on the bundle list. Claiming a narrowing that did
+  // not happen is the same defect this function replaced, one level down. Which
+  // list a row was compared against is named, because "上游内建集合" is only true
+  // for the rows that came from a shipped template.
+  if (matched.length && !narrowed.length) {
+    const sources = new Set(matched.map(row => row.bundlesSource));
+    if (sources.size === 1 && sources.has('upstream-template')) {
       parts.push('bundles 本就与上游内建集合一致，manifest 未被改写');
+    } else if (sources.size === 1) {
+      parts.push('bundles 与安装事实推导结果一致，manifest 未被改写');
+    } else {
+      parts.push('bundles 与各自的 bundle 来源一致，manifest 未被改写');
     }
   }
-  if (skipped.length) {
-    parts.push(`跳过 ${skipped.length} 个：${skipped.map(row => `${row.profile}（${row.reason}）`).join('、')}`);
+  if (patchOnly.length) {
+    parts.push(`${patchOnly.length} 个 profile 没有可用的 bundle 来源，只处理了 patch 层`
+      + `（bundles 原样未动）：${patchOnly.map(row => row.profile).join('、')}`);
+  }
+  if (unchanged.length) {
+    parts.push(`${would ? '无需处理' : '本就无需处理'} ${unchanged.length} 个：${unchanged.map(row => row.profile).join('、')}`);
+  }
+  if (failed.length) {
+    parts.push(`${would ? '会失败' : '失败'} ${failed.length} 个：${failed.map(row => `${row.profile}（${row.reason}）`).join('、')}`);
   }
   if (report.ignored?.length) {
     parts.push(`忽略 ${report.ignored.length} 个非 profile 目录：${report.ignored.map(row => row.profile).join('、')}`);

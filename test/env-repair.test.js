@@ -16,7 +16,7 @@
 // legacy shape be exercised at all.
 
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,7 +56,8 @@ async function fakeAppBoot(npmPrefix, { shape = 'modern' } = {}) {
   // Mirrors upstream's `initProfile`: it never touches a file that already
   // exists, which is what makes it safe to point at a directory someone else
   // created.
-  await writeFile(join(appBoot, 'lib', 'index.js'), `import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+  await writeFile(join(appBoot, 'lib', 'index.js'), `import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { basename, join } from 'node:path';
 
 export const PROFILE_TEMPLATES = ${templates};
@@ -77,6 +78,24 @@ export function initProfile(dir, bundles, patchReload = 'live') {
   if (!existsSync(patch)) writeFileSync(patch, '[]\\n');
   const workspace = join(dir, 'pnpm-workspace.yaml');
   if (!existsSync(workspace)) writeFileSync(workspace, 'packages:\\n  - .\\n');
+}
+
+// The two reads dpx derives a third-party profile's bundle list with. Both mirror
+// upstream's own exports: probe the resolution paths from one anchor (the
+// installation first, then the profile directory) for a directory holding the
+// package manifest.
+export function readProfileManifest(binName, dir) {
+  return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+}
+
+export function resolveBundleDir(binName, packageName, installAnchor, profileDir) {
+  for (const anchor of [installAnchor, join(profileDir, 'package.json')]) {
+    for (const searchPath of createRequire(anchor).resolve.paths(packageName) ?? []) {
+      const candidate = join(searchPath, packageName);
+      if (existsSync(join(candidate, 'package.json'))) return candidate;
+    }
+  }
+  throw new Error(binName + ': cannot resolve profile bundle ' + JSON.stringify(packageName));
 }
 `);
 }
@@ -120,6 +139,22 @@ async function writeProfile(paths, profile, { bundles, dependencies = {}, patch 
   if (patch !== null) await writeFile(join(directory, 'cordis.patch.yml'), patch);
   await writeFile(join(directory, 'cordis.yml'), 'x: 1\n');
   await writeFile(join(directory, 'pnpm-workspace.yaml'), 'packages:\n  - .\n');
+  return directory;
+}
+
+/**
+ * A package installed into a profile's own `node_modules`, the way `dsh plugin`
+ * leaves one: resolvable from the profile directory, and declaring whether it is a
+ * bundle.
+ */
+async function installPlugin(paths, profile, name, { bundle = true } = {}) {
+  const directory = join(paths.dshHome, 'profiles', profile, 'node_modules', ...name.split('/'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'package.json'), `${JSON.stringify({
+    name,
+    version: '1.0.0',
+    ...(bundle ? { dsh: { bundle: { patch: './cordis.patch.yml' } } } : {}),
+  }, null, 2)}\n`);
   return directory;
 }
 
@@ -213,18 +248,124 @@ test('a broken profile keeps its patch byte-for-byte and its dependencies', asyn
   assert.equal(await readFile(join(directory, 'cordis.yml'), 'utf8'), untouched);
 });
 
-test('re-running a repaired profile changes nothing and still exits zero', async () => {
+test('an empty patch layer is never backed up, and a clean profile stays untouched', async () => {
   const fixture = await environmentFixture();
-  await writeProfile(fixture.paths, 'web', { bundles: ['@evil/third-party-bundle'] });
-  assert.equal(repair(fixture).status, 0);
+  const directory = await writeProfile(fixture.paths, 'web', { bundles: ['@evil/third-party-bundle'] });
+  const first = repair(fixture);
+  assert.equal(first.status, 0, first.stderr);
+  const firstRow = JSON.parse(first.stdout).profiles[0];
+  assert.equal(firstRow.kind, 'repaired');
+  // The patch file holds the shipped empty layer (`[]`), so there is nothing in it
+  // to preserve. The old code renamed it anyway, which left one `.bak-` file per
+  // profile per run and, for a profile whose only repairable part is the patch
+  // layer, made the whole run a no-op that still littered.
+  assert.equal(firstRow.patchExists, true);
+  assert.equal(firstRow.patchEmpty, true);
+  assert.equal(firstRow.backupPath, undefined);
+  assert.equal(existsSync(join(directory, 'cordis.patch.yml')), true);
+  assert.deepEqual((await readdir(directory)).filter(name => name.includes('.bak-')), []);
 
   const second = repair(fixture);
   assert.equal(second.status, 0, second.stderr);
-  const row = JSON.parse(second.stdout).profiles[0];
+  const report = JSON.parse(second.stdout);
+  assert.equal(report.profiles[0].kind, 'unchanged');
+  assert.equal(report.profiles[0].changed, false);
+  assert.match(report.message, /没有 patch 文件需要备份/);
+});
+
+test('a manifest that carries a BOM is repaired rather than reported as damaged', async () => {
+  const fixture = await environmentFixture();
+  const directory = await writeProfile(fixture.paths, 'web', { bundles: ['@evil/third-party-bundle'] });
+  const manifestPath = join(directory, 'package.json');
+  await writeFile(manifestPath, `\uFEFF${await readFile(manifestPath, 'utf8')}`);
+
+  const result = repair(fixture);
+  // `dpx env repair` exists to survive a BOM'd manifest, so it cannot classify one
+  // as damaged: the reader strips the BOM (for parsing only) and the write path
+  // produces a manifest without it.
+  assert.equal(result.status, 0, result.stderr);
+  const row = JSON.parse(result.stdout).profiles[0];
+  assert.equal(row.kind, 'repaired');
+  assert.equal(row.manifestRewritten, true);
+  const text = await readFile(manifestPath, 'utf8');
+  assert.notEqual(text.charCodeAt(0), 0xfeff);
+  assert.deepEqual(JSON.parse(text).dsh.profile.bundles, WEB_BUNDLES);
+});
+
+test('a custom profile with no upstream template gets the patch half and keeps its bundles', async () => {
+  const fixture = await environmentFixture();
+  const broken = 'this: [is: not, valid: yaml\n  - broken\n\t!!tabs\n';
+  const directory = await writeProfile(fixture.paths, 'custom', {
+    bundles: ['@deepseek-ai/dsh-base', '@evil/third-party-bundle'],
+    dependencies: { '@evil/third-party-bundle': '^1.0.0' },
+    patch: broken,
+  });
+
+  const result = repair(fixture);
+  // A third-party profile is not a failure. A batch scan reports the half it could
+  // not do and exits zero, so a repair run in a script or a CI job never goes red
+  // merely because the environment contains a profile upstream ships no template
+  // for.
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const row = report.profiles.find(candidate => candidate.profile === 'custom');
+  assert.equal(row.kind, 'repaired');
+  assert.equal(row.bundlesSource, 'untouched');
   assert.equal(row.changed, false);
-  // No patch file was there to back up, and the summary must not claim one was.
-  assert.equal(row.patchExists, false);
-  assert.match(JSON.parse(second.stdout).message, /没有 patch 文件需要备份/);
+  // The one action that needs no bundle list: the broken patch layer is preserved
+  // byte-for-byte and stops being loaded.
+  assert.equal(row.patchExists, true);
+  assert.equal(await readFile(row.backupPath, 'utf8'), broken);
+  assert.equal(existsSync(join(directory, 'cordis.patch.yml')), false);
+  const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
+  assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
+  assert.deepEqual(manifest.dependencies, { '@evil/third-party-bundle': '^1.0.0' });
+  // The half that was not done is stated, on stderr, without failing the command.
+  assert.deepEqual(report.warnings.length, 1);
+  assert.match(report.warnings[0], /无出厂模板：custom/);
+  assert.match(result.stderr, /\[WARN\] 无出厂模板：custom/);
+});
+
+test('naming a custom profile explicitly repairs it as well', async () => {
+  const fixture = await environmentFixture();
+  await writeProfile(fixture.paths, 'custom', { bundles: ['@deepseek-ai/dsh-base'], patch: 'broken: [\n' });
+  const result = repair(fixture, ['--profile', 'custom']);
+  assert.equal(result.status, 0, result.stderr);
+  const row = JSON.parse(result.stdout).profiles[0];
+  assert.equal(row.kind, 'repaired');
+  // An explicit name is a request, not a permission: the same two halves run. With
+  // no dependencies to read, the derived list is the in-box layer the profile
+  // already had, so the patch half is the whole change.
+  assert.equal(row.bundlesSource, 'derived-from-install');
+  assert.equal(row.changed, false);
+  assert.equal(row.patchEmpty, false);
+});
+
+test('naming a custom profile that does not exist is the one no-template failure', async () => {
+  const fixture = await environmentFixture();
+  const result = repair(fixture, ['--profile', 'custom']);
+  assert.equal(result.status, 1);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.ok, false);
+  assert.equal(report.profiles[0].kind, 'failed');
+  assert.equal(report.profiles[0].reason, 'no-upstream-template');
+  assert.equal(existsSync(join(fixture.paths.dshHome, 'profiles', 'custom')), false);
+});
+
+test('a run whose rows are all unchanged still exits zero, and says so', async () => {
+  const fixture = await environmentFixture();
+  await writeProfile(fixture.paths, 'web', { bundles: WEB_BUNDLES, patch: null });
+  await writeProfile(fixture.paths, 'custom', { bundles: ['@deepseek-ai/dsh-base'], patch: null });
+  const result = repair(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.ok, true);
+  const kinds = new Map(report.profiles.map(row => [row.profile, row.kind]));
+  assert.equal(kinds.get('web'), 'unchanged');
+  assert.equal(kinds.get('custom'), 'unchanged');
+  // `repaired` is the compatibility view of the same rows: not a failure.
+  assert.deepEqual(report.profiles.map(row => row.repaired), [true, true]);
+  assert.match(report.message, /本就无需处理 2 个/);
 });
 
 test('the legacy bare-array template shape is read, not misreported as missing', async () => {
@@ -346,4 +487,70 @@ test('a creation that fails is a row, not an aborted command', async () => {
   assert.equal(report.profiles[0].repaired, false);
   assert.equal(report.profiles[0].reason, 'cannot-create');
   assert.equal(result.status, 1);
+});
+
+test('a third-party bundle list is derived from the installed state', async () => {
+  const fixture = await environmentFixture();
+  const directory = await writeProfile(fixture.paths, 'custom', {
+    // Drifted: the plugin is installed, but it is missing from the layer list.
+    bundles: ['@deepseek-ai/dsh-base'],
+    dependencies: { '@evil/third-party-bundle': '^1.0.0' },
+    patch: null,
+  });
+  await installPlugin(fixture.paths, 'custom', '@evil/third-party-bundle');
+
+  const result = repair(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const row = report.profiles[0];
+  assert.equal(row.kind, 'repaired');
+  assert.equal(row.bundlesSource, 'derived-from-install');
+  assert.deepEqual(row.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
+  const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
+  assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
+  // The in-box layer is kept, the installed plugin joins the stack, and the run
+  // says which list it wrote rather than implying an upstream template.
+  assert.match(report.warnings[0], /按安装事实推导/);
+});
+
+test('a dependency that declares no dsh.bundle is not turned into a layer', async () => {
+  const fixture = await environmentFixture();
+  await writeProfile(fixture.paths, 'custom', {
+    bundles: ['@deepseek-ai/dsh-base'],
+    dependencies: { '@evil/plain-library': '^1.0.0' },
+    patch: null,
+  });
+  await installPlugin(fixture.paths, 'custom', '@evil/plain-library', { bundle: false });
+
+  const result = repair(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const row = JSON.parse(result.stdout).profiles[0];
+  assert.equal(row.kind, 'unchanged');
+  assert.equal(row.bundlesSource, 'derived-from-install');
+  assert.deepEqual(row.bundles, ['@deepseek-ai/dsh-base']);
+});
+
+test('a listed bundle that cannot be verified refuses the derived list', async () => {
+  const fixture = await environmentFixture();
+  const broken = 'still: [broken\n\t!!x\n';
+  const directory = await writeProfile(fixture.paths, 'custom', {
+    // The `dsh-tui` shape: a third-party layer is listed and its package is not
+    // installed where dpx can read it. Narrowing to a list computed without it
+    // would drop the user's layer on the strength of a package nobody can read, so
+    // the derivation refuses and the patch half runs instead.
+    bundles: ['@deepseek-ai/dsh-base', '@evil/third-party-bundle'],
+    dependencies: { '@evil/third-party-bundle': '^1.0.0' },
+    patch: broken,
+  });
+
+  const result = repair(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const row = report.profiles[0];
+  assert.equal(row.bundlesSource, 'untouched');
+  assert.equal(row.changed, false);
+  const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
+  assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
+  assert.equal(await readFile(row.backupPath, 'utf8'), broken);
+  assert.match(report.warnings[0], /无法核实/);
 });
