@@ -489,10 +489,13 @@ test('a creation that fails is a row, not an aborted command', async () => {
   assert.equal(result.status, 1);
 });
 
-test('a third-party bundle list is derived from the installed state', async () => {
+test('a drifted third-party bundle list is reported, not rewritten', async () => {
   const fixture = await environmentFixture();
   const directory = await writeProfile(fixture.paths, 'custom', {
-    // Drifted: the plugin is installed, but it is missing from the layer list.
+    // Drifted: the plugin is installed but missing from the layer list. DSH
+    // represents "this bundle is disabled" exactly the same way (the dependency
+    // declares `dsh.bundle` and is absent from the list), so a recovery command
+    // cannot tell the two apart and must not decide for the user.
     bundles: ['@deepseek-ai/dsh-base'],
     dependencies: { '@evil/third-party-bundle': '^1.0.0' },
     patch: null,
@@ -503,14 +506,17 @@ test('a third-party bundle list is derived from the installed state', async () =
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   const row = report.profiles[0];
-  assert.equal(row.kind, 'repaired');
-  assert.equal(row.bundlesSource, 'derived-from-install');
-  assert.deepEqual(row.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
+  assert.equal(row.kind, 'unchanged');
+  assert.equal(row.bundlesSource, 'untouched');
+  assert.deepEqual(row.bundlesDrift, {
+    source: 'derived-from-install',
+    current: ['@deepseek-ai/dsh-base'],
+    expected: ['@deepseek-ai/dsh-base', '@evil/third-party-bundle'],
+  });
   const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
-  assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@evil/third-party-bundle']);
-  // The in-box layer is kept, the installed plugin joins the stack, and the run
-  // says which list it wrote rather than implying an upstream template.
-  assert.match(report.warnings[0], /按安装事实推导/);
+  assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base']);
+  assert.match(report.warnings[0], /未改动 bundles/);
+  assert.match(report.message, /与安装事实推导不一致，已报告但未改动/);
 });
 
 test('a dependency that declares no dsh.bundle is not turned into a layer', async () => {

@@ -551,6 +551,7 @@ function repairSummary(report) {
   const narrowed = repaired.filter(row => row.changed && !row.created);
   const patchOnly = [...repaired, ...unchanged].filter(row => row.bundlesSource === 'untouched' && !row.created);
   const matched = [...repaired, ...unchanged].filter(row => row.bundlesSource !== 'untouched' && !row.created);
+  const drifted = [...repaired, ...unchanged].filter(row => row.bundlesDrift);
   const parts = [];
   if (repaired.length === 0) {
     parts.push(would ? '没有需要处理的 profile' : '没有修复任何 profile');
@@ -591,6 +592,10 @@ function repairSummary(report) {
   if (patchOnly.length) {
     parts.push(`${patchOnly.length} 个 profile 没有可用的 bundle 来源，只处理了 patch 层`
       + `（bundles 原样未动）：${patchOnly.map(row => row.profile).join('、')}`);
+  }
+  if (drifted.length) {
+    parts.push(`${drifted.length} 个 profile 的 bundles 与安装事实推导不一致，已报告但未改动`
+      + `（恢复不替用户决定启用/禁用）：${drifted.map(row => row.profile).join('、')}`);
   }
   if (unchanged.length) {
     parts.push(`${would ? '无需处理' : '本就无需处理'} ${unchanged.length} 个：${unchanged.map(row => row.profile).join('、')}`);

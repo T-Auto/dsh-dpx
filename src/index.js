@@ -1393,7 +1393,8 @@ function profileTemplate(templates, profile) {
  * installed package no longer declares `dsh.bundle`) makes the whole derivation
  * refuse: writing a narrower list than the user has, on the strength of a package
  * that cannot be read, is exactly how a repair turns into a worse profile. The
- * caller falls back to the patch half and reports it.
+ * caller falls back to the patch half and reports it — and a derivation that
+ * merely differs from the current list is reported the same way, never written.
  */
 export function derivedProfileTemplate(profileDir, manifest, probe) {
   if (typeof probe?.resolveBundleDir !== 'function' || typeof probe?.readProfileManifest !== 'function') return undefined;
@@ -1563,7 +1564,9 @@ export async function repairProfileDirectory(profileDir, {
  *
  *   * a profile with a bundle list dpx can source — upstream's template, or the
  *     list derived from the installed state for a third-party profile upstream
- *     ships no template for — is narrowed to it (`bundlesSource`);
+ *     ships no template for — is narrowed to it (`bundlesSource`); the derived
+ *     list only ever *confirms* the profile's own list, because a derivation that
+ *     differs cannot tell "drifted" from "deliberately disabled" (`bundlesDrift`);
  *   * a profile with no sourceable list still gets the half that needs none: its
  *     patch layer is moved aside and its bundles are left exactly as they are
  *     (`patchOnly`, `bundlesSource: 'untouched'`). Refusing to act, or pretending
@@ -1636,8 +1639,17 @@ export async function repairEnvironment({
     // list can still be derived from what is installed. A shipped template always
     // wins — upstream's list belongs to the product, while the derivation is a
     // reading of a state that may itself have drifted.
+    //
+    // A derivation that *differs* from the profile's list is reported, not written.
+    // DSH represents "this bundle is disabled" as "the dependency declares
+    // `dsh.bundle` and is absent from `dsh.profile.bundles`", so rewriting the list
+    // from the installed state is indistinguishable from re-enabling a bundle the
+    // user turned off — a decision a recovery command has no business making.
+    // Upstream's own `reconcileProfilePlugins` exposes that as `preserveDisabled`,
+    // and its caller (the install path) is the one that owns the answer.
     let derived;
     let derivedRefused;
+    let derivedDrift;
     if (!template && hadManifest) {
       const read = readJsonDocument(manifestPath, { domain: 'authoritative' });
       if (read.ok) {
@@ -1645,6 +1657,12 @@ export async function repairEnvironment({
         if (derived?.unverified?.length) {
           derivedRefused = derived.unverified;
           derived = undefined;
+        } else if (derived) {
+          const current = Array.isArray(read.value?.dsh?.profile?.bundles) ? read.value.dsh.profile.bundles : [];
+          if (JSON.stringify(current) !== JSON.stringify(derived.bundles)) {
+            derivedDrift = { source: derived.source, current: [...current], expected: [...derived.bundles] };
+            derived = undefined;
+          }
         }
       }
     }
@@ -1748,7 +1766,10 @@ export async function repairEnvironment({
         dryRun,
         timestamp,
       });
-      if (!plan) {
+      if (derivedDrift) {
+        warnings.push(`无出厂模板：${profile}（上游 PROFILE_TEMPLATES 没有它；按安装事实推导的清单与现有清单不同——现有 ${derivedDrift.current.join('、') || '(空)'}，`
+          + `推导 ${derivedDrift.expected.join('、') || '(空)'}。dpx 未改动 bundles：DSH 用“依赖声明了 dsh.bundle 但不在清单里”表示禁用，恢复不该替用户决定启用或禁用）`);
+      } else if (!plan) {
         warnings.push(derivedRefused
           ? `无出厂模板：${profile}（上游 PROFILE_TEMPLATES 没有它；按安装事实推导时，有已列出但无法核实的包：${derivedRefused.join('、')}，dpx 不写无法核实的清单；本次只处理 patch 层，bundles 原样未动）`
           : `无出厂模板：${profile}（上游 PROFILE_TEMPLATES 没有它，且无法从安装事实推导 bundle 清单；本次只处理 patch 层，bundles 原样未动）`);
@@ -1764,6 +1785,9 @@ export async function repairEnvironment({
         kind: acted ? 'repaired' : 'unchanged',
         repaired: true,
         created: created.includes(profile),
+        // Reported, never written (see above): what a full repair would have
+        // narrowed to, and what the profile currently lists.
+        ...(derivedDrift ? { bundlesDrift: derivedDrift } : {}),
         ...repair,
       });
     } catch (error) {
